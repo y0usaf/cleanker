@@ -1,0 +1,25 @@
+{
+  "name": "pi-cleanker",
+  "version": "0.1.0",
+  "description": "Runs cleanker at agent_end: strips new comments and unreferenced prose.",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/y0usaf/cleanker"
+  },
+  "keywords": [
+    "pi-package",
+    "cleanker",
+    "comments",
+    "documentation",
+    "policy"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extension.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
