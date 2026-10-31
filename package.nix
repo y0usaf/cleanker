@@ -15,6 +15,7 @@ pkgs.stdenv.mkDerivation {
       --add-flags $out/libexec/cleanker.py \
       --prefix PATH : ${pkgs.lib.makeBinPath [pkgs.ast-grep]}
     printf '#!/bin/sh\nexec %s/bin/cleanker hook\n' "$out" > $out/share/git-hooks/pre-commit
-    chmod +x $out/share/git-hooks/pre-commit
+    printf '#!/bin/sh\nexec %s/bin/cleanker pre-push\n' "$out" > $out/share/git-hooks/pre-push
+    chmod +x $out/share/git-hooks/pre-commit $out/share/git-hooks/pre-push
   '';
 }

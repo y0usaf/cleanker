@@ -63,7 +63,7 @@ def common_dir(repo):
     return p.stdout.strip() or repo
 
 def discover(root):
-    gitdirs = sh(["find",root,"-maxdepth","6","-name",".git","-not","-path","*/.git/*"]).stdout.split()
+    gitdirs = [x for x in sh(["find",root,"-maxdepth","6","-name",".git","-not","-path","*/.git/*","-print0"]).stdout.split("\0") if x]
     groups = {}
     for g in gitdirs:
         d = repo_root(g)
@@ -105,8 +105,22 @@ def rule(lang, kinds=None, inside=None):
         body = "  all:\n    - kind: %s\n    - inside:\n        kind: %s\n        stopBy: end\n" % (ks[0], inside)
     return "id: c\nlanguage: %s\nrule:\n%s" % (lang, body)
 
+def chunks(files, limit=800, budget=400_000):
+    batch, size = [], 0
+    for f in files:
+        if batch and (len(batch) >= limit or size + len(f) > budget):
+            yield batch; batch, size = [], 0
+        batch.append(f); size += len(f) + 1
+    if batch: yield batch
+
 def scan(files, lang, kinds=None, inside=None):
     if not files: return []
+    out = []
+    for part in chunks(files):
+        out.extend(scan_chunk(part, lang, kinds, inside))
+    return out
+
+def scan_chunk(files, lang, kinds=None, inside=None):
     p = sh([ag(),"scan","--inline-rules",rule(lang,kinds,inside),"--json=stream",*files])
     if p.returncode != 0 and not p.stdout.strip():
         print("cleanker: ast-grep failed for %s (%s)" % (lang, (p.stderr or "").strip().splitlines()[:1]), file=sys.stderr)
@@ -260,7 +274,8 @@ def strip_src(src, nodes, strip_docs, containers=()):
                     l = left + b" " + right
                 else:
                     l = left + right
-            l = l.rstrip()
+            cr = b"\r" if lines[i].endswith(b"\r") else b""
+            l = l.rstrip() + cr
         if after_drop and l.strip() == b"" and out and out[-1].strip() == b"":
             after_drop = False; continue
         if l.strip(): after_drop = False
@@ -337,7 +352,7 @@ def refs_to(repo, rel):
             hits.append((f, "exact" if rel in t else "basename"))
     return hits
 
-def apply(repo, strip_docs=False, dry=False, fmt=False, force=False):
+def apply(repo, strip_docs=False, dry=False, fmt=False, force=False, only=None):
     changes = []
     if not force:
         reason = policy_reason(repo)
@@ -347,13 +362,25 @@ def apply(repo, strip_docs=False, dry=False, fmt=False, force=False):
             return [("", "skip-not-enrolled", 0)]
     exclude = ignore_patterns(repo)
     lf = lang_files(repo)
-    nodes_by_file, errs_before, containers = scan_all(lf)
+    if only:
+        scoped = set(os.path.abspath(x) for x in only)
+        lf = {k: [f for f in v if f in scoped] for k, v in lf.items()}
+        lf = {k: v for k, v in lf.items() if v}
+        if not lf:
+            nodes_by_file, errs_before, containers = {}, collections.Counter(), {}
+        else:
+            nodes_by_file, errs_before, containers = scan_all(lf)
+    else:
+        nodes_by_file, errs_before, containers = scan_all(lf)
     for lang, files in lf.items():
         byfile = {f: nodes_by_file[f] for f in files if nodes_by_file.get(f)}
         if not byfile: continue
         edited, orig = {}, {}
         for f, ns in byfile.items():
-            src = open(f, encoding="utf-8", errors="surrogateescape").read()
+            try:
+                src = open(f, encoding="utf-8", newline="").read()
+            except UnicodeDecodeError:
+                changes.append((f, "skip-encoding", 0)); continue
             new = strip_src(src, ns, strip_docs, containers.get(f, ()))
             if new != src:
                 edited[f] = new; orig[f] = src
@@ -365,7 +392,7 @@ def apply(repo, strip_docs=False, dry=False, fmt=False, force=False):
             try:
                 mode = os.stat(f).st_mode
                 if not os.access(f, os.W_OK): os.chmod(f, mode | 0o200)
-                open(f,"w",encoding="utf-8",errors="surrogateescape").write(new)
+                open(f,"w",encoding="utf-8",newline="").write(new)
                 os.chmod(f, mode)
             except OSError:
                 changes.append((f, "REJECT_IO", 0))
@@ -374,7 +401,7 @@ def apply(repo, strip_docs=False, dry=False, fmt=False, force=False):
         _, errs_after, _ = scan_all({lang: list(edited)})
         for f in list(edited):
             if errs_before.get(f, 0) == 0 and errs_after.get(f, 0) > 0:
-                open(f,"w",encoding="utf-8",errors="surrogateescape").write(orig[f])
+                open(f,"w",encoding="utf-8",newline="").write(orig[f])
                 changes.append((f, "REJECT_SYNTAX", len(byfile[f])))
                 del edited[f]
         for f in edited:
@@ -383,6 +410,7 @@ def apply(repo, strip_docs=False, dry=False, fmt=False, force=False):
                 c = fmt_cmd(repo, lang, f)
                 if c: sh(c)
     for m in tracked(repo):
+        if only and os.path.join(repo, m) not in {os.path.abspath(x) for x in only}: continue
         if not m.lower().endswith((".md",".mdx")): continue
         if any(x in SKIP_DIRS for x in m.split("/")): continue
         pol = md_policy(m)
@@ -417,7 +445,7 @@ def staged(repo):
     return [f for f in git(repo,"diff","--cached","--name-only","--diff-filter=ACMR","-z").stdout.split("\0") if f]
 
 def added_lines(repo, path):
-    out = git(repo,"diff","--cached","-U0","--",path).stdout
+    out = git(repo,"diff","--cached","-U0","-M","--",path).stdout
     lines = set()
     for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", out, re.M):
         start = int(m.group(1)); count = int(m.group(2) or 1)
@@ -439,6 +467,10 @@ def remote_owner(repo):
     rem = git(repo,"remote","get-url","origin").stdout.strip()
     m = re.search(r"[:/]([^/:]+)/[^/]+?(?:\.git)?$", rem)
     return m.group(1) if m else ""
+
+def shadowed(repo):
+    local = git(repo,"config","--local","--get","core.hooksPath").stdout.strip()
+    return local if local else ""
 
 def policy_reason(repo):
     local = git(repo,"config","--local","--get",SWEEP_KEY)
@@ -484,6 +516,49 @@ def ignore_patterns(top):
         if line in {"*", "**", "/*"}: continue
         out.append(line)
     return out
+
+def pre_push() -> int:
+    top = git(os.getcwd(),"rev-parse","--show-toplevel").stdout.strip()
+    if not top or not enrolled(top): return 0
+    if os.environ.get("CLEANKER_SKIP") == "1": return 0
+    empty = git(top,"hash-object","-t","tree","/dev/null").stdout.strip()
+    changed = set()
+    for line in sys.stdin.read().splitlines():
+        parts = line.split()
+        if len(parts) < 4: continue
+        local_sha, remote_sha = parts[1], parts[3]
+        if set(local_sha) == {"0"}: continue
+        base = remote_sha if set(remote_sha) != {"0"} else empty
+        for f in git(top,"diff","--name-only","-z","%s..%s" % (base, local_sha)).stdout.split("\0"):
+            if f: changed.add(f)
+    if not changed: return 0
+    patterns = ignore_patterns(top)
+    files = [f for f in changed if not ignored(patterns, f) and not any(x in SKIP_DIRS for x in f.split("/"))]
+    lf = collections.defaultdict(list)
+    md = []
+    for f in files:
+        low = f.lower()
+        if low.endswith((".md",".mdx")):
+            if md_policy(f) == "drop": md.append(f)
+            continue
+        ext = low.rsplit(".",1)[-1] if "." in os.path.basename(low) else ""
+        lang = LANG_OF_EXT.get(ext)
+        full = os.path.join(top, f)
+        if lang and os.path.isfile(full): lf[lang].append(full)
+    nodes_by_file, _, _ = scan_all(lf)
+    bad = []
+    for f, nodes in nodes_by_file.items():
+        for n in nodes:
+            if classified(n["text"], False) == "keep": continue
+            bad.append((os.path.relpath(f, top), n["text"].strip().splitlines()[0][:60]))
+    for m in md:
+        if refs_in(top, m): continue
+        bad.append((m, "unreferenced prose"))
+    if not bad: return 0
+    for path, why in bad[:40]:
+        print("cleanker: %s: %s" % (path, why))
+    print("cleanker: %d violation(s) in the commits being pushed; `cleanker clean` fixes them, CLEANKER_SKIP=1 or --no-verify bypasses" % len(bad))
+    return 1
 
 def hook() -> int:
     top = git(os.getcwd(),"rev-parse","--show-toplevel").stdout.strip()
@@ -545,7 +620,8 @@ def paths_to_repos(args, root):
     for raw in (args or [root]):
         if raw is None: continue
         p = os.path.abspath(os.path.expanduser(raw))
-        top = git(p,"rev-parse","--show-toplevel").stdout.strip()
+        probe = p if os.path.isdir(p) else os.path.dirname(p)
+        top = git(probe,"rev-parse","--show-toplevel").stdout.strip()
         if top: out.append(top)
         elif os.path.isdir(p): out.extend(r["path"] for r in default_scope(p))
         else: print("cleanker: %s is not a repository or a directory" % raw, file=sys.stderr)
@@ -564,15 +640,17 @@ def main():
         s.add_argument("--format", action="store_true", help="run the repository formatter afterwards")
         s.add_argument("--force", action="store_true", help="touch explicitly disabled repos and referenced docs")
         s.add_argument("--check", action="store_true", help="exit 1 when anything would change")
+        s.add_argument("--file", action="append", default=[], help="restrict to these paths")
     for name in ("status","enroll","disenroll"):
         s = sub.add_parser(name)
         s.add_argument("paths", nargs="*", default=[])
     sub.add_parser("hook", help="git pre-commit entry point")
+    sub.add_parser("pre-push", help="git pre-push entry point")
     a = ap.parse_args()
     root = os.path.expanduser("~/dev")
-    if a.cmd == "hook":
+    if a.cmd in {"hook","pre-push"}:
         try:
-            sys.exit(hook())
+            sys.exit(hook() if a.cmd == "hook" else pre_push())
         except Exception as exc:
             print("cleanker: policy check skipped (%s); commit allowed" % exc.__class__.__name__, file=sys.stderr)
             sys.exit(0)
@@ -584,8 +662,13 @@ def main():
                                      "on" if state else "off", policy_reason(p) or "-"))
         return
     if a.cmd == "status":
-        rows = [(os.path.relpath(r["path"], os.path.expanduser("~")), policy_reason(r["path"])) for r in discover(root)]
-        on = [r for r in rows if r[1] and not r[1].startswith("explicit off")]
+        rows = []
+        for r in discover(root):
+            why = policy_reason(r["path"])
+            hook = shadowed(r["path"])
+            if why and hook: why = "shadowed by local hooksPath=" + hook
+            rows.append((os.path.relpath(r["path"], os.path.expanduser("~")), why))
+        on = [r for r in rows if r[1] and not r[1].startswith("explicit off") and not r[1].startswith("shadowed")]
         off = [r for r in rows if r not in on]
         print("enforced: %d   unenforced: %d" % (len(on), len(off)))
         for path, why in on: print("  on   %-48s %s" % (path, why))
@@ -594,7 +677,8 @@ def main():
     dry = a.cmd == "dry-run"
     total = collections.Counter()
     for path in repos:
-        ch = apply(path, a.strip_docs, dry=dry, fmt=a.format, force=a.force)
+        only = [os.path.abspath(x) for x in a.file] or None
+        ch = apply(path, a.strip_docs, dry=dry, fmt=a.format, force=a.force, only=only)
         n = collections.Counter(k for _, k, _ in ch)
         if not ch: continue
         print("%-52s strip=%-4d md=%-3d referenced=%-3d legal=%-2d reject=%d" % (
