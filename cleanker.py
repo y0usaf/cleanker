@@ -652,7 +652,7 @@ def main():
         try:
             sys.exit(hook() if a.cmd == "hook" else pre_push())
         except Exception as exc:
-            print("cleanker: policy check skipped (%s); commit allowed" % exc.__class__.__name__, file=sys.stderr)
+            print("cleanker: policy check skipped (%s: %s); commit allowed" % (exc.__class__.__name__, exc), file=sys.stderr)
             sys.exit(0)
     scope_default = root if a.cmd in {"status","enroll","disenroll"} else "."
     repos = paths_to_repos(a.paths or [scope_default], root)
@@ -665,8 +665,8 @@ def main():
         rows = []
         for r in discover(root):
             why = policy_reason(r["path"])
-            hook = shadowed(r["path"])
-            if why and hook: why = "shadowed by local hooksPath=" + hook
+            local_hook = shadowed(r["path"])
+            if why and local_hook: why = "shadowed by local hooksPath=" + local_hook
             rows.append((os.path.relpath(r["path"], os.path.expanduser("~")), why))
         on = [r for r in rows if r[1] and not r[1].startswith("explicit off") and not r[1].startswith("shadowed")]
         off = [r for r in rows if r not in on]
