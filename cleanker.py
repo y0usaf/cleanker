@@ -24,7 +24,8 @@ DIRECTIVE = [
   r"Apache License", r"MIT License", r"Licensed under", r"@generated", r"DO NOT EDIT",
   r"^#\s*renovate:", r"^#\s*yamllint", r"^#\s*yaml-language-server", r"^#\s*editorconfig",
   r"<!--\s*prettier-", r"<!--\s*markdownlint", r"<!--\s*htmlhint", r"<!--\s*cspell",
-  r"<!--#include", r"<!--\s*keep",
+  r"<!--#include", r"<!--\s*keep", r"^//\s*==/?UserScript==",
+  r"^//\s*@(name|namespace|version|description|author|license|match|exclude-match|include|exclude|grant|connect|require|resource|icon|run-at|noframes|inject-into|sandbox|unwrap|downloadURL|updateURL|homepageURL|supportURL)(:[\w-]+)?(\s|$)",
 ]
 DOC = [r"^///", r"^//!", r"^/\*\*", r"^/\*!"]
 KEEP_MD = [r"^README(\.|$)", r"^README$", r"^AGENTS\.md$"]
