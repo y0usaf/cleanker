@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, bisect, collections, fnmatch, functools, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, ast, bisect, collections, fnmatch, functools, json, os, re, shutil, subprocess, sys, tempfile
 
 SKIP_DIRS = {".git","node_modules","target","dist","build","result",".direnv","vendor","ref","corpus",
              "third_party","uv-cache",".venv","venv",".cache",".dioxus","engine-reference","subprojects"}
@@ -25,9 +25,9 @@ DIRECTIVE = [
   r"^#\s*renovate:", r"^#\s*yamllint", r"^#\s*yaml-language-server", r"^#\s*editorconfig",
   r"<!--\s*prettier-", r"<!--\s*markdownlint", r"<!--\s*htmlhint", r"<!--\s*cspell",
   r"<!--#include", r"<!--\s*keep", r"^//\s*==/?UserScript==",
+  r"@(?:type|typedef|template|satisfies|callback|enum|import|overload)\b", r"@(?:param|returns?)\s*\{",
   r"^//\s*@(name|namespace|version|description|author|license|match|exclude-match|include|exclude|grant|connect|require|resource|icon|run-at|noframes|inject-into|sandbox|unwrap|downloadURL|updateURL|homepageURL|supportURL)(:[\w-]+)?(\s|$)",
 ]
-DOC = [r"^///", r"^//!", r"^/\*\*", r"^/\*!"]
 KEEP_MD = [r"^README(\.|$)", r"^README$", r"^AGENTS\.md$"]
 LEGAL_MD = [r"^LICEN[CS]E", r"^NOTICE", r"^PROVENANCE", r"^THIRD_PARTY"]
 _ag = None
@@ -132,6 +132,18 @@ def scan_chunk(files, lang, kinds=None, inside=None):
             except ValueError: pass
     return out
 
+def scan_rule(files, rules):
+    out = []
+    for part in chunks(files):
+        p = sh([ag(),"scan","--inline-rules",rules,"--json=stream",*part])
+        for line in p.stdout.splitlines():
+            if '"ruleId"' in line:
+                try: out.append(json.loads(line))
+                except ValueError: pass
+    return out
+
+PY_DOC = "id: d_Python\nlanguage: Python\nrule:\n  kind: expression_statement\n  has:\n    kind: string\n    stopBy: end\n"
+
 def scan_all(by_lang):
     langs = [k for k, v in by_lang.items() if v]
     out = collections.defaultdict(list)
@@ -145,6 +157,8 @@ def scan_all(by_lang):
         rules.append("id: e_%s\nlanguage: %s\nrule:\n  kind: ERROR\n" % (lang, lang))
         if lang == "Tsx":
             rules.append("id: j_%s\nlanguage: %s\nrule:\n  kind: jsx_expression\n" % (lang, lang))
+        if lang == "Python":
+            rules.append(PY_DOC)
         files.extend(by_lang[lang])
     p = sh([ag(),"scan","--inline-rules","\n---\n".join(rules),"--json=stream",*files])
     if p.returncode != 0 and not p.stdout.strip():
@@ -153,6 +167,8 @@ def scan_all(by_lang):
             for n in scan(by_lang[lang], lang, ["ERROR"]): errs[n["file"]] += 1
             if lang == "Tsx":
                 for c in scan(by_lang[lang], lang, ["jsx_expression"]): containers[c["file"]].append(c)
+            if lang == "Python":
+                for n in scan_rule(by_lang[lang], PY_DOC): n["doc"] = True; out[n["file"]].append(n)
     else:
         for line in p.stdout.splitlines():
             if '"ruleId"' not in line: continue
@@ -161,10 +177,47 @@ def scan_all(by_lang):
             rid = n["ruleId"]
             if rid.startswith("e_"): errs[n["file"]] += 1
             elif rid.startswith("j_"): containers[n["file"]].append(n)
+            elif rid.startswith("d_"): n["doc"] = True; out[n["file"]].append(n)
             else: out[n["file"]].append(n)
     for lang in langs:
         for n in embedded(by_lang[lang], lang): out[n["file"]].append(n)
+    cand = {n["file"] for ns in out.values() for n in ns if n.get("doc")}
+    docs = py_docs(cand)
+    for f, ns in out.items():
+        if f not in cand: continue
+        table = docs.get(f, {})
+        keep = []
+        for n in ns:
+            if not n.get("doc"):
+                keep.append(n); continue
+            at = n["range"]["byteOffset"]["start"]
+            if at not in table: continue
+            n["replace"] = table[at]; keep.append(n)
+        out[f] = keep
     return out, errs, containers
+
+def py_docs(files):
+    out = {}
+    for f in files:
+        try:
+            with open(f, "rb") as fh: data = fh.read()
+            tree = ast.parse(data)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        starts, off, table = [0], 0, {}
+        for line in data.split(b"\n"):
+            off += len(line) + 1; starts.append(off)
+        stack = [tree]
+        while stack:
+            n = stack.pop()
+            if not isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)): continue
+            stack.extend(ast.iter_child_nodes(n))
+            if not n.body: continue
+            d = n.body[0]
+            if not (isinstance(d, ast.Expr) and isinstance(d.value, ast.Constant) and isinstance(d.value.value, str)): continue
+            table[starts[d.lineno - 1] + d.col_offset] = "pass" if len(n.body) == 1 else ""
+        if table: out[f] = table
+    return out
 
 EMBED = {"Html": [("JavaScript","script_element","js"), ("Css","style_element","css")]}
 
@@ -186,14 +239,11 @@ def embedded(files, lang):
             os.unlink(tmp)
     return out
 
-KEEP_RE = re.compile("|".join("(?:%s)" % p for p in DIRECTIVE))
-DOC_RE = re.compile("|".join("(?:%s)" % p for p in DOC))
+KEEP_RE = re.compile("|".join("(?:%s)" % p for p in DIRECTIVE), re.M)
 
 @functools.lru_cache(maxsize=8192)
-def classified(text, strip_docs):
-    t = text.strip()
-    if KEEP_RE.search(t): return "keep"
-    if not strip_docs and DOC_RE.search(text.lstrip("\n")): return "keep"
+def classified(text):
+    if KEEP_RE.search(text.strip()): return "keep"
     return "drop"
 
 def md_policy(rel):
@@ -204,22 +254,7 @@ def md_policy(rel):
         if re.search(p, base): return "legal"
     return "drop"
 
-def inventory(root, strip_docs=False):
-    rows = []
-    for r in discover(root):
-        p = r["path"]
-        mds = [(m, md_policy(m)) for m in tracked(p)
-               if m.lower().endswith((".md",".mdx")) and not any(x in SKIP_DIRS for x in m.split("/"))]
-        per = {}
-        for lang, files in lang_files(p).items():
-            ms = scan(files, lang)
-            keep = sum(1 for m in ms if classified(m["text"], strip_docs)=="keep")
-            per[lang] = {"files":len(files),"comments":len(ms),"keep":keep,"drop":len(ms)-keep}
-        rows.append({**{k:v for k,v in r.items() if k!="common"}, "md":mds, "langs":per,
-                     "md_drop":sum(1 for _,pol in mds if pol=="drop")})
-    return rows
-
-def strip_src(src, nodes, strip_docs, containers=()):
+def strip_src(src, nodes, containers=()):
     data = src.encode()
     lines = data.split(b"\n")
     starts, off = [], 0
@@ -231,7 +266,7 @@ def strip_src(src, nodes, strip_docs, containers=()):
         return starts[k] + len(lines[k])
     cuts = collections.defaultdict(list)
     dropped = set()
-    verdict = {id(n): classified(n["text"], strip_docs) for n in nodes}
+    verdict = {id(n): classified(n["text"]) for n in nodes}
     kept = [(n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
             for n in nodes if verdict[id(n)] == "keep"]
     drops = [(n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
@@ -249,7 +284,15 @@ def strip_src(src, nodes, strip_docs, containers=()):
                 if cs0 <= a and b <= ce0: inside = inside.replace(data[a:b], b"", 1)
             if inside.replace(b"{", b"").replace(b"}", b"").strip() == b"":
                 s, e = cs0, ce0
+        rep = (n.get("replace") or "").encode()
         i, j = span(s, e)
+        if rep:
+            cuts[i].append((s - starts[i], len(lines[i]), rep))
+            if i < j and data[e:line_end(j)].strip():
+                cuts[j].append((0, e - starts[j], b"")); dropped.update(range(i + 1, j))
+            else:
+                dropped.update(range(i + 1, j + 1))
+            continue
         if i == j and data[starts[i]:s].strip() == b"" and data[e:line_end(i)].strip() == b"":
             dropped.add(i); continue
         if i < j and data[starts[i]:s].strip() == b"" and data[e:line_end(j)].strip() == b"":
@@ -261,17 +304,19 @@ def strip_src(src, nodes, strip_docs, containers=()):
             if k < j and lo == starts[k] and hi == line_end(k):
                 dropped.add(k)
             else:
-                cuts[k].append((lo - starts[k], hi - starts[k]))
+                cuts[k].append((lo - starts[k], hi - starts[k], b""))
             k += 1
     out, after_drop = [], False
     for i, l in enumerate(lines):
         if i in dropped:
             after_drop = True; continue
         if i in cuts:
-            for a, b in sorted(cuts[i], reverse=True):
+            for a, b, rep in sorted(cuts[i], reverse=True):
                 a = max(0, a); b = min(len(l), b)
                 left = l[:a]; right = l[b:]
-                if left.rstrip() and right.lstrip():
+                if rep:
+                    l = left + rep + right
+                elif left.rstrip() and right.lstrip():
                     l = left + b" " + right
                 else:
                     l = left + right
@@ -353,7 +398,7 @@ def refs_to(repo, rel):
             hits.append((f, "exact" if rel in t else "basename"))
     return hits
 
-def apply(repo, strip_docs=False, dry=False, fmt=False, force=False, only=None):
+def apply(repo, dry=False, fmt=False, force=False, only=None):
     changes = []
     if not force:
         reason = policy_reason(repo)
@@ -382,7 +427,7 @@ def apply(repo, strip_docs=False, dry=False, fmt=False, force=False, only=None):
                 src = open(f, encoding="utf-8", newline="").read()
             except UnicodeDecodeError:
                 changes.append((f, "skip-encoding", 0)); continue
-            new = strip_src(src, ns, strip_docs, containers.get(f, ()))
+            new = strip_src(src, ns, containers.get(f, ()))
             if new != src:
                 edited[f] = new; orig[f] = src
         if not edited: continue
@@ -550,7 +595,7 @@ def pre_push() -> int:
     bad = []
     for f, nodes in nodes_by_file.items():
         for n in nodes:
-            if classified(n["text"], False) == "keep": continue
+            if classified(n["text"]) == "keep": continue
             bad.append((os.path.relpath(f, top), n["text"].strip().splitlines()[0][:60]))
     for m in md:
         if refs_in(top, m): continue
@@ -604,7 +649,7 @@ def hook() -> int:
         f = tmp_of.get(tmp)
         if not f: continue
         for n in found:
-            if classified(n["text"], False) == "keep": continue
+            if classified(n["text"]) == "keep": continue
             line = blobs[f][1].count(b"\n", 0, n["range"]["byteOffset"]["start"]) + 1
             if line in added_lines(top, f):
                 bad.append((f, line, n["text"].strip().splitlines()[0][:70]))
@@ -637,7 +682,6 @@ def main():
     for name in ("clean","dry-run"):
         s = sub.add_parser(name)
         s.add_argument("paths", nargs="*", default=[])
-        s.add_argument("--strip-docs", action="store_true", help="also remove doc comments")
         s.add_argument("--format", action="store_true", help="run the repository formatter afterwards")
         s.add_argument("--force", action="store_true", help="touch explicitly disabled repos and referenced docs")
         s.add_argument("--check", action="store_true", help="exit 1 when anything would change")
@@ -679,7 +723,7 @@ def main():
     total = collections.Counter()
     for path in repos:
         only = [os.path.abspath(x) for x in a.file] or None
-        ch = apply(path, a.strip_docs, dry=dry, fmt=a.format, force=a.force, only=only)
+        ch = apply(path, dry=dry, fmt=a.format, force=a.force, only=only)
         n = collections.Counter(k for _, k, _ in ch)
         if not ch: continue
         print("%-52s strip=%-4d md=%-3d referenced=%-3d legal=%-2d reject=%d" % (
