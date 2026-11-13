@@ -398,7 +398,444 @@ def refs_to(repo, rel):
             hits.append((f, "exact" if rel in t else "basename"))
     return hits
 
-def apply(repo, dry=False, fmt=False, force=False, only=None):
+TESTS_KEY = "cleanker.strip-tests"
+TEST_DIR_NAMES = {"test","tests","testing","testdata","test-data","test_data","spec","specs","__tests__","__snapshots__","checks"}
+FIXTURE_DIR_NAMES = {"fixtures","fixture","data","snapshots","__snapshots__","testdata","golden","goldens"}
+CODE_EXTS = {"py","pyi","rs","go","js","ts","tsx","jsx","mjs","cjs","cs","fs","rb","lua","lisp","el","ex","exs",
+             "c","h","cc","cpp","hpp","cxx","hh","sh","bash","zsh","nix","kt","swift","scala","java","php","dart","pl","r"}
+DATA_EXTS = {"toml","json","yaml","yml","txt","snap","csv","tsv"}
+PROJ_EXTS = {"csproj","fsproj","vbproj","sln","slnx"}
+COMMON_BASENAMES = {"mod.rs","lib.rs","main.rs","__init__.py","index.js","index.ts","index.tsx","build.rs",
+                    "utils.py","utils.rs","setup.py","common.py","common.rs","helpers.py","helpers.rs","support.py"}
+E2E_NAME_RE = re.compile(r"(?:^|[._-])(?:e2e|end[-_]?to[-_]?end|integration|acceptance|functional|smoke|vm|nixos)(?:[._-]|$)", re.I)
+TEST_STEM_RE = re.compile(r"^(?:test_.+|[^/]*_test|[^/]*[._-](?:test|spec)|tests?)$", re.I)
+TEST_PROJ_RE = re.compile(r"\.(?:tests?|specs?)$", re.I)
+EXT_LANG = {"jsx":"js","ts":"js","tsx":"js","mjs":"js","cjs":"js","bash":"sh","zsh":"sh","pyi":"py","fs":"cs"}
+SPAWN = {
+  "py": r"subprocess\.|os\.system\(|os\.exec[lv]p?e?|pexpect|pty\.spawn|requests\.(?:get|post|put|delete|patch|request)|urllib\.request|http\.client|http\.server|socket\.|socketserver|HTTPServer|BaseHTTPRequestHandler|uvicorn|gunicorn|flask|FastAPI|TestClient|playwright|selenium|docker|podman|qemu",
+  "rs": r"std::process::Command|process::Command|assert_cmd|Command::cargo_bin|CARGO_BIN_EXE_|escargot|duct::|reqwest|TcpStream|TcpListener|UnixListener|UdpSocket|hyper::|docker|podman|qemu",
+  "go": r"os/exec|exec\.Command|httptest\.NewServer|http\.(?:Get|Post|Client|ListenAndServe)|net\.Listen|docker|podman|qemu",
+  "js": r"child_process|execa\(|spawnSync\(|(?<![.\w])spawn\(|supertest|playwright|cypress|puppeteer|fetch\(|axios|createServer|listen\(",
+  "cs": r"Process\.Start|ProcessStartInfo|HttpClient|WebApplicationFactory|HttpListener|TcpListener|Kestrel|Docker",
+  "lisp": r"run-program|launch-program|uiop:|sb-bsd-sockets|usocket|hunchentoot",
+  "nix": r"runNixOSTest|nixosTest|nixos/lib/testing",
+  "zig": r"std\.process|ChildProcess|execv",
+  "sh": r"(?s).",
+}
+
+def tests_on(repo, override=False):
+    return bool(override) or setting(repo, TESTS_KEY).strip().lower() in {"true","1","yes","on"}
+
+def ext_of(rel):
+    base = rel.rsplit("/",1)[-1]
+    return base.rsplit(".",1)[-1].lower() if "." in base else ""
+
+def stem_of(rel):
+    base = rel.rsplit("/",1)[-1]
+    return base.rsplit(".",1)[0] if "." in base else base
+
+def test_stem(stem):
+    return bool(TEST_STEM_RE.match(stem) or re.match(r"^[A-Za-z0-9_.-]*Tests?$", stem))
+
+def test_candidate(rel):
+    e = ext_of(rel)
+    stem = stem_of(rel)
+    if e in PROJ_EXTS: return False
+    if e not in CODE_EXTS and e not in DATA_EXTS: return False
+    deep = rel.split("/")[:-1]
+    for k, seg in enumerate(deep):
+        if seg.lower() not in TEST_DIR_NAMES and not TEST_PROJ_RE.search(seg): continue
+        if any(s.lower() in FIXTURE_DIR_NAMES for s in deep[k+1:]): return True
+    if e == "rs" and deep and deep[-1].lower() == "tests": return True
+    if e in CODE_EXTS and deep and (deep[-1].lower() in TEST_DIR_NAMES or TEST_PROJ_RE.search(deep[-1])): return True
+    if e in CODE_EXTS and any(seg.lower() == "__tests__" for seg in deep): return True
+    return bool(e in CODE_EXTS and test_stem(stem))
+
+def e2e_named(rel):
+    if any(E2E_NAME_RE.search(seg) for seg in rel.split("/")[:-1]): return "end-to-end path"
+    return "end-to-end name" if E2E_NAME_RE.search(stem_of(rel)) else ""
+
+def spawn_hit(rel, text):
+    e = ext_of(rel)
+    pat = SPAWN.get(EXT_LANG.get(e, e))
+    if not pat: return ""
+    if re.search(pat, text, re.I):
+        return "spawns a process or a server"
+    return ""
+
+def project_names(repo):
+    names = set()
+    for rel in tracked(repo):
+        base = rel.rsplit("/",1)[-1]
+        if base not in {"Cargo.toml","pyproject.toml","package.json"} and not base.endswith((".csproj",".fsproj")):
+            continue
+        try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
+        except OSError: continue
+        m = None
+        if base == "Cargo.toml":
+            m = re.search(r'(?ms)^\[package\].*?^name\s*=\s*"([^"]+)"', text)
+        elif base == "pyproject.toml":
+            m = re.search(r'(?m)^name\s*=\s*"([^"]+)"', text)
+        elif base == "package.json":
+            m = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+        else:
+            m = re.search(r"<(?:RootNamespace|AssemblyName)>([^<]+)<", text)
+        if m:
+            names.add(m.group(1))
+            names.add(m.group(1).rsplit("/",1)[-1].replace("-", "_"))
+    for rel in tracked(repo):
+        parts = rel.split("/")
+        if parts[-1] == "__init__.py" and len(parts) > 1: names.add(parts[-2])
+        if parts[0] == "src" and len(parts) > 2: names.add(parts[1])
+        if rel.endswith(".py") and len(parts[-1]) > 4:
+            stem = parts[-1][:-3]
+            if stem not in {"__init__", "conftest", "setup"} and not test_stem(stem): names.add(stem)
+    return {n for n in names if len(n) > 1}
+
+def internal_ref(rel, text, names):
+    e = ext_of(rel)
+    if e == "rs":
+        if re.search(r"\buse\s+(?:crate|super|self)::", text) or re.search(r"\bmod\s+\w+\s*;", text): return True
+        return any(re.search(r"\b(?:use|extern\s+crate)\s+%s\b" % re.escape(n), text) for n in names)
+    if e == "py":
+        if re.search(r"\bfrom\s+\.\s*import\b|\bfrom\s+\.\w+\s+import\b", text): return True
+        return any(re.search(r"(?m)^\s*(?:from\s+%s(?:\.|\s+import)|import\s+%s(?:\.|\s|$))" % (re.escape(n), re.escape(n)), text) for n in names)
+    if e == "go":
+        return bool(re.search(r"(?m)^package\s+\w+", text))
+    if e in {"js","ts","tsx","jsx","mjs","cjs"}:
+        if re.search(r"""(?:from|require\()\s*["']\.{1,2}/""", text): return True
+        return any(re.search(r"""(?:from|require\()\s*["'](?:%s)(?:["'/])""" % re.escape(n), text) for n in names)
+    if e in {"cs","fs"}:
+        return any(re.search(r"\busing\s+%s\b" % re.escape(n), text) for n in names)
+    if e in {"lisp","el","clj"}:
+        return bool(re.search(r"\(in-package|\(defpackage|load-system|quickload|\brequire\b", text))
+    if e == "zig":
+        return bool(re.search(r"@import\(\"([^\"]*src|[^\"]*cwd|[^\"]*root)", text))
+    return False
+
+SAFE_CALLS = {"new","from","default","parse","open","load","read","write","format","vec","Some","Ok","Err","None","String",
+              "Vec","Path","PathBuf","Duration","range","len","print","println","drop","assert","require","import","str",
+              "int","float","list","dict","set","tuple","bool","isinstance","getattr","setattr","hasattr","super","self",
+              "test","it","describe","beforeEach","afterEach","before","after","expect","jest","vi","mock","fn","spyOn",
+              "pytest","fixture","parametrize","raises","mark","skip","xfail","assert_equal","assert_raises","deftest",
+              "for","if","while","match","loop","return","catch","with","switch","else","case","try","except","finally",
+              "in","is","not","and","or","del","lambda","yield","await","raise","pass","global","nonlocal","assert_eq",
+              "let","create_dir","create_dir_all","remove_dir_all","remove_file","read_dir","metadata","canonicalize",
+              "temp_dir","current_dir","set_var","var","sleep","now","elapsed","from_secs","from_millis","exists",
+              "is_file","is_dir","to_path_buf","display","with_extension","set_extension","parent","file_name","components",
+              "read_to_string","copy","rename","join_paths","env_var","args_os","exit","stdin","stdout","stderr",
+              "from_str","to_bytestring","try_from","try_into","id","from_utf8","to_str","as_bytes","write_all"}
+CALL_RE = re.compile(r"([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*\(")
+FUNC_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?(?:fn|def|func|function)\s+([A-Za-z_]\w*)|(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_]\w*\s*=>)")
+
+STD_TYPES = {"String","Vec","Path","PathBuf","Duration","Instant","SystemTime","HashMap","BTreeMap","HashSet","BTreeSet",
+             "OsStr","OsString","SocketAddr","IpAddr","Box","Arc","Rc","Cell","RefCell","Mutex","RwLock","Uuid","Regex",
+             "Json","Value","Map","Seq","Number","Cow","Bytes","Chars","Iter","Option","Result","Range","VecDeque"}
+STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
+def calls_in(text):
+    masked = STR_RE.sub('""', text)
+    out = []
+    for m in CALL_RE.finditer(masked):
+        before = masked[m.start()-1] if m.start() else ""
+        if before in {"!", "[", "#", "@"}: continue
+        parts = [p.strip() for p in m.group(1).split("::")]
+        out.append((parts[-1], before == ".", len(parts) > 1 and parts[0][:1].isupper(), parts[0]))
+    return out
+
+def function_map(repo):
+    fmap = {}
+    exts = {"rs","py","zig","go","js","ts","tsx","jsx","mjs","cjs","cs","lisp","el","rb","lua"}
+    for rel in tracked(repo):
+        if ext_of(rel) not in exts or any(x in SKIP_DIRS for x in rel.split("/")): continue
+        try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
+        except OSError: continue
+        marks = [(m.start(), m.group(1) or m.group(2)) for m in FUNC_RE.finditer(text)]
+        for i, (start, name) in enumerate(marks):
+            stop = marks[i+1][0] if i + 1 < len(marks) else len(text)
+            fmap.setdefault(name, []).append((rel, bool(spawn_hit(rel, text[start:stop]))))
+    return fmap
+
+def module_of(rel):
+    parts = rel.split("/")
+    stem = parts[-1].rsplit(".",1)[0]
+    if stem in {"mod","index","__init__","main","lib"} and len(parts) > 1: return parts[-2]
+    return stem
+
+def imported_modules(rel, text):
+    mods = set()
+    for m in re.finditer(r"(?m)^\s*from\s+([\w.]+)\s+import|^\s*import\s+([\w.]+)", text):
+        mod = m.group(1) or m.group(2)
+        mods.add(mod.split(".")[0]); mods.add(mod.split(".")[-1])
+    e = ext_of(rel)
+    if e == "rs":
+        for m in re.finditer(r"\buse\s+([A-Za-z_]\w*(?:::\w+)*)", text):
+            path = m.group(1)
+            if path.split("::")[0] not in {"std","core","alloc"}:
+                mods.update({path.split("::")[0], path.split("::")[-1]})
+    if e in {"js","ts","tsx","jsx","mjs","cjs"}:
+        for m in re.finditer(r"""(?:from|require\()\s*["']([^"']+)["']""", text):
+            mods.add(os.path.basename(m.group(1)).rsplit(".",1)[0])
+    if e == "go":
+        for m in re.finditer(r'"([\w./-]+)"', text):
+            mods.add(m.group(1).rsplit("/",1)[-1])
+    return {m for m in mods if m}
+
+def spawns(name, rel, text, fmap, mods):
+    defs = fmap.get(name)
+    if not defs: return None
+    same = [s for r, s in defs if r == rel]
+    if same: return any(same)
+    near = [s for r, s in defs if module_of(r) in mods]
+    if near: return any(near)
+    return any(s for _, s in defs)
+
+def unit_proven(rel, text, fmap):
+    if spawn_hit(rel, text): return False
+    mods = imported_modules(rel, text)
+    for name, method, type_path, head in calls_in(text):
+        if type_path and head in STD_TYPES: continue
+        hit = spawns(name, rel, text, fmap, mods)
+        if hit is True: return False
+        if hit is False: continue
+        if type_path: continue
+        if name in SAFE_CALLS or name[:1].isupper(): continue
+        if method: continue
+        return False
+    return True
+
+def classify_test(rel, text, names, fmap):
+    named = e2e_named(rel)
+    if named: return "e2e", named
+    hit = spawn_hit(rel, text)
+    if hit: return "e2e", hit
+    if not internal_ref(rel, text, names): return "unknown", ""
+    if not unit_proven(rel, text, fmap): return "unknown", ""
+    return "unit", ""
+
+def test_root(rel):
+    parts = rel.split("/")
+    for k, seg in enumerate(parts[:-1]):
+        if seg.lower() in TEST_DIR_NAMES or TEST_PROJ_RE.search(seg):
+            return "/".join(parts[:k+1])
+    return ""
+
+def drop_spans(src, spans):
+    lines = src.split("\n")
+    drop = set()
+    for a, b in spans: drop.update(range(max(a, 0), b + 1))
+    out, after = [], False
+    for i, l in enumerate(lines):
+        if i in drop:
+            after = True; continue
+        if after and l.strip() == "" and out and out[-1].strip() == "":
+            after = False; continue
+        if l.strip(): after = False
+        out.append(l)
+    while out and out[-1].strip() == "": out.pop()
+    body = "\n".join(out)
+    return body + "\n" if body else body
+
+def rust_str_end(text, i):
+    j = i - 1; hashes = 0
+    while j >= 0 and text[j] == "#": hashes += 1; j -= 1
+    if j >= 0 and text[j] == "r":
+        close = '"' + "#" * hashes
+        k = text.find(close, i + 1)
+        return len(text) if k < 0 else k + len(close)
+    k = i + 1
+    while k < len(text):
+        if text[k] == "\\": k += 2; continue
+        if text[k] == '"': return k + 1
+        k += 1
+    return len(text)
+
+def rust_brace_end(text, i):
+    n = len(text); depth = 0; j = i
+    while j < n:
+        c = text[j]
+        if c == '"': j = rust_str_end(text, j); continue
+        if c == "'" and j + 2 < n and text[j + 2] == "'": j += 3; continue
+        if text.startswith("//", j):
+            k = text.find("\n", j); j = n if k < 0 else k; continue
+        if text.startswith("/*", j):
+            k = text.find("*/", j + 2); j = n if k < 0 else k + 2; continue
+        if c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0: return j + 1
+        j += 1
+    return n
+
+def rust_item_end(text, i):
+    n = len(text); j = i
+    while j < n:
+        c = text[j]
+        if c == '"': j = rust_str_end(text, j); continue
+        if c == "'" and j + 2 < n and text[j + 2] == "'": j += 3; continue
+        if text.startswith("//", j):
+            k = text.find("\n", j); j = n if k < 0 else k; continue
+        if text.startswith("/*", j):
+            k = text.find("*/", j + 2); j = n if k < 0 else k + 2; continue
+        if c == "{": return rust_brace_end(text, j)
+        if c == ";": return j + 1
+        j += 1
+    return n
+
+RUST_ATTR_RE = re.compile(r"^\s*#\[.*\]\s*$")
+RUST_CFG_TEST_RE = re.compile(r"^\s*#\[\s*cfg\(\s*(?:all\s*\(\s*)?test\b[^\]]*\]\s*$")
+RUST_TEST_ATTR_RE = re.compile(r"^\s*#\[\s*(?:[A-Za-z_][\w:]*::)?test\s*(?:\(.*\))?\s*\]\s*$")
+
+def rust_test_spans(text):
+    lines = text.split("\n")
+    starts, off = [], 0
+    for l in lines: starts.append(off); off += len(l) + 1
+    spans, i = [], 0
+    while i < len(lines):
+        if not (RUST_CFG_TEST_RE.match(lines[i]) or RUST_TEST_ATTR_RE.match(lines[i])):
+            i += 1; continue
+        a = i
+        while a > 0 and RUST_ATTR_RE.match(lines[a-1]): a -= 1
+        k = i + 1
+        while k < len(lines) and RUST_ATTR_RE.match(lines[k]): k += 1
+        while k < len(lines) and lines[k].strip() == "": k += 1
+        if k >= len(lines): break
+        end = rust_item_end(text, starts[k])
+        last = text.count("\n", 0, end)
+        spans.append({"start": a, "end": last, "text": "\n".join(lines[a:last+1])})
+        i = last + 1
+    return spans
+
+def py_test_spans(text):
+    try: tree = ast.parse(text)
+    except (SyntaxError, ValueError): return []
+    lines = text.split("\n")
+    spans = []
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not re.match(r"^test_?", n.name): continue
+        elif isinstance(n, ast.ClassDef):
+            if not re.match(r"^(?:Test[A-Z0-9_]|TestCase)", n.name): continue
+        else:
+            continue
+        first = min([d.lineno for d in getattr(n, "decorator_list", [])] + [n.lineno])
+        last = (getattr(n, "end_lineno", None) or n.lineno) - 1
+        spans.append({"start": first - 1, "end": last, "text": "\n".join(lines[first-1:last+1])})
+    return spans
+
+ZIG_TEST_RE = re.compile(r"^[ \t]*test\b[^{;]*\{")
+
+def zig_test_spans(text):
+    lines = text.split("\n")
+    starts, off = [], 0
+    for l in lines: starts.append(off); off += len(l) + 1
+    spans = []
+    for i, l in enumerate(lines):
+        m = ZIG_TEST_RE.match(l)
+        if not m: continue
+        brace = starts[i] + m.end() - 1
+        end = rust_brace_end(text, brace)
+        last = text.count("\n", 0, end)
+        spans.append({"start": i, "end": last, "text": "\n".join(lines[i:last+1])})
+    return spans
+
+def test_spans(rel, text):
+    e = ext_of(rel)
+    if e == "rs": return rust_test_spans(text)
+    if e == "py": return py_test_spans(text)
+    if e == "zig": return zig_test_spans(text)
+    return []
+
+def strip_test_blocks(rel, src, fmap):
+    drop = [(s["start"], s["end"]) for s in test_spans(rel, src) if unit_proven(rel, s["text"], fmap)]
+    return drop_spans(src, drop) if drop else src
+
+def cargo_trim(text, doomed=()):
+    lines = text.split("\n")
+    out, i, changed = [], 0, False
+    while i < len(lines):
+        h = re.match(r"^\s*\[\[?([^\]]+)\]\]?\s*(?:#.*)?$", lines[i])
+        name = h.group(1).strip() if h else ""
+        end = i
+        if h:
+            end = i + 1
+            while end < len(lines) and not re.match(r"^\s*\[", lines[end]): end += 1
+        drop = False
+        if name == "test":
+            block = "\n".join(lines[i:end])
+            pm = re.search(r"^\s*path\s*=\s*\"([^\"]+)\"", block, re.M)
+            nm = re.search(r"^\s*name\s*=\s*\"([^\"]+)\"", block, re.M)
+            target = os.path.normpath(pm.group(1)).replace(os.sep, "/") if pm else ""
+            drop = bool(target and target in doomed) or bool(nm and not target and nm.group(1) in {r.rsplit("/",1)[-1].rsplit(".",1)[0] for r in doomed})
+        if drop:
+            changed = True; i = end
+            continue
+        out.append(lines[i]); i += 1
+    while out and out[-1].strip() == "": out.pop()
+    return "\n".join(out) + "\n", changed
+
+def plan_tests(repo, exclude, only=None, fmap=None):
+    files = [f for f in tracked(repo) if not any(x in SKIP_DIRS for x in f.split("/")) and os.path.isfile(os.path.join(repo, f))]
+    if only:
+        scoped = {os.path.relpath(os.path.abspath(x), repo).replace(os.sep, "/") for x in only}
+        files = [f for f in files if f in scoped]
+    if not files: return [], [], {}
+    names = project_names(repo)
+    fmap = function_map(repo) if fmap is None else fmap
+    cands, keeps = [], []
+    for rel in files:
+        if ignored(exclude, rel) or not test_candidate(rel): continue
+        full = os.path.join(repo, rel)
+        if ext_of(rel) in DATA_EXTS:
+            cands.append(rel); continue
+        try: text = open(full, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            keeps.append((full, "keep-e2e:unreadable test file", 0)); continue
+        verdict, why = classify_test(rel, text, names, fmap)
+        if verdict == "e2e": keeps.append((full, "keep-e2e:" + why, 0))
+        elif verdict == "unknown": keeps.append((full, "keep-unknown:no evidence it is a unit test", 0))
+        else: cands.append(rel)
+    roots = {test_root(p) for p, kind, _ in keeps if kind.startswith("keep-e2e")}
+    roots.discard("")
+    pending = []
+    for rel in cands:
+        if test_root(rel) in roots and any(s.lower() in FIXTURE_DIR_NAMES for s in rel.split("/")[:-1]):
+            keeps.append((os.path.join(repo, rel), "keep-e2e:fixtures of end-to-end tests", 0)); continue
+        pending.append(rel)
+    cands = pending
+    cargo = {}
+    for rel in files:
+        if rel.rsplit("/",1)[-1] == "Cargo.toml":
+            try: cargo[rel] = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
+            except OSError: pass
+    declared = set()
+    for rel, text in cargo.items():
+        sec = ""
+        for line in text.split("\n"):
+            h = re.match(r"^\s*\[\[?([^\]]+)\]\]?\s*$", line)
+            if h: sec = h.group(1).strip(); continue
+            m = re.match(r"^\s*path\s*=\s*\"([^\"]+)\"", line)
+            if m and sec != "test" and not sec.startswith("dev-dependencies"):
+                declared.add(os.path.normpath(os.path.join(rel.rsplit("/",1)[0], m.group(1))).replace(os.sep, "/"))
+    remaining = [f for f in files if f not in set(cands) and f.rsplit("/",1)[-1] != "Cargo.toml"]
+    blob = corpus(repo, remaining)
+    deletes = []
+    for rel in cands:
+        base = rel.rsplit("/",1)[-1]
+        stem = stem_of(rel)
+        needles = [base] + ([stem] if len(stem) >= 8 and base not in COMMON_BASENAMES else [])
+        if rel in declared:
+            keeps.append((os.path.join(repo, rel), "keep-ref:declared as a Cargo target", 0)); continue
+        if rel.encode() in blob or any(n not in COMMON_BASENAMES and n.encode() in blob for n in needles):
+            keeps.append((os.path.join(repo, rel), "keep-ref:referenced by retained files", 0)); continue
+        deletes.append(rel)
+    edits = {}
+    for rel, text in cargo.items():
+        new, changed = cargo_trim(text, doomed=set(deletes))
+        if changed and new != text: edits[os.path.join(repo, rel)] = new
+    return deletes, keeps, edits
+
+def apply(repo, dry=False, fmt=False, force=False, only=None, strip_tests=False):
     changes = []
     if not force:
         reason = policy_reason(repo)
@@ -407,6 +844,11 @@ def apply(repo, dry=False, fmt=False, force=False, only=None):
         if not reason:
             return [("", "skip-not-enrolled", 0)]
     exclude = ignore_patterns(repo)
+    tests = tests_on(repo, strip_tests)
+    fmap = function_map(repo) if tests else {}
+    deletes, keeps, edits = plan_tests(repo, exclude, only, fmap) if tests else ([], [], {})
+    doomed = {os.path.join(repo, rel) for rel in deletes}
+    hold = {p for p, kind, _ in keeps if kind.startswith(("keep-e2e", "keep-unknown", "keep-ref:"))}
     lf = lang_files(repo)
     if only:
         scoped = set(os.path.abspath(x) for x in only)
@@ -420,19 +862,24 @@ def apply(repo, dry=False, fmt=False, force=False, only=None):
         nodes_by_file, errs_before, containers = scan_all(lf)
     for lang, files in lf.items():
         byfile = {f: nodes_by_file[f] for f in files if nodes_by_file.get(f)}
-        if not byfile: continue
+        targets = [f for f in files if byfile.get(f) or tests]
+        if not targets: continue
         edited, orig = {}, {}
-        for f, ns in byfile.items():
+        for f in targets:
+            if f in doomed or not os.path.isfile(f): continue
             try:
                 src = open(f, encoding="utf-8", newline="").read()
             except UnicodeDecodeError:
                 changes.append((f, "skip-encoding", 0)); continue
+            ns = byfile.get(f, [])
             new = strip_src(src, ns, containers.get(f, ()))
+            if tests and f not in hold:
+                new = strip_test_blocks(f, new, fmap)
             if new != src:
                 edited[f] = new; orig[f] = src
         if not edited: continue
         if dry:
-            for f in edited: changes.append((f, "strip", len(byfile[f])))
+            for f in edited: changes.append((f, "strip", len(byfile.get(f, []))))
             continue
         for f, new in edited.items():
             try:
@@ -448,10 +895,10 @@ def apply(repo, dry=False, fmt=False, force=False, only=None):
         for f in list(edited):
             if errs_before.get(f, 0) == 0 and errs_after.get(f, 0) > 0:
                 open(f,"w",encoding="utf-8",newline="").write(orig[f])
-                changes.append((f, "REJECT_SYNTAX", len(byfile[f])))
+                changes.append((f, "REJECT_SYNTAX", len(byfile.get(f, []))))
                 del edited[f]
         for f in edited:
-            changes.append((f, "strip", len(byfile[f])))
+            changes.append((f, "strip", len(byfile.get(f, []))))
             if fmt:
                 c = fmt_cmd(repo, lang, f)
                 if c: sh(c)
@@ -472,6 +919,24 @@ def apply(repo, dry=False, fmt=False, force=False, only=None):
             changes.append((full, "md-gone", 0)); continue
         changes.append((full, "rm-md", 0))
         if not dry: os.remove(full)
+    if tests:
+        for path, why, _ in keeps: changes.append((path, why, 0))
+        for rel in deletes:
+            full = os.path.join(repo, rel)
+            if not os.path.exists(full):
+                changes.append((full, "rm-test-gone", 0)); continue
+            changes.append((full, "rm-test", 0))
+            if not dry: os.remove(full)
+        for full, text in edits.items():
+            changes.append((full, "test-wiring", 0))
+            if not dry:
+                try:
+                    mode = os.stat(full).st_mode
+                    if not os.access(full, os.W_OK): os.chmod(full, mode | 0o200)
+                    open(full,"w",encoding="utf-8",newline="").write(text)
+                    os.chmod(full, mode)
+                except OSError:
+                    changes.append((full, "REJECT_IO", 0))
     return changes
 
 def dirty(repo):
@@ -606,6 +1071,20 @@ def pre_push() -> int:
     for m in md:
         if refs_in(top, m): continue
         bad.append((m, "unreferenced prose"))
+    if tests_on(top):
+        names = project_names(top)
+        fmap = function_map(top)
+        for f in files:
+            full = os.path.join(top, f)
+            try: text = open(full, encoding="utf-8", errors="ignore").read()
+            except OSError: continue
+            if test_candidate(f):
+                if classify_test(f, text, names, fmap)[0] == "unit":
+                    bad.append((f, "unit test (cleanker.strip-tests)"))
+                continue
+            if ext_of(f) not in {"rs","py","zig"} or e2e_named(f): continue
+            if any(unit_proven(f, s["text"], fmap) for s in test_spans(f, text)):
+                bad.append((f, "in-file unit test (cleanker.strip-tests)"))
     if not bad: return 0
     for path, why in bad[:40]:
         print("cleanker: %s: %s" % (path, why))
@@ -659,11 +1138,33 @@ def hook() -> int:
             line = blobs[f][1].count(b"\n", 0, n["range"]["byteOffset"]["start"]) + 1
             if line in added_lines(top, f):
                 bad.append((f, line, n["text"].strip().splitlines()[0][:70]))
+    if tests_on(top):
+        names = project_names(top)
+        fmap = function_map(top)
+        for f in staged(top):
+            if ignored(patterns, f) or any(x in SKIP_DIRS for x in f.split("/")): continue
+            if not test_candidate(f) or e2e_named(f): continue
+            text = blobs[f][1].decode("utf-8", "ignore") if f in blobs else ""
+            if not text:
+                try: text = open(os.path.join(top, f), encoding="utf-8", errors="ignore").read()
+                except OSError: continue
+            if classify_test(f, text, names, fmap)[0] == "unit":
+                bad.append((f, 0, "test: unit test (cleanker.strip-tests)"))
+        for f, (lang, data, tmp) in blobs.items():
+            if e2e_named(f) or test_candidate(f): continue
+            text = data.decode("utf-8", "ignore")
+            added = added_lines(top, f)
+            hit = 0
+            for s in test_spans(f, text):
+                if not unit_proven(f, s["text"], fmap): continue
+                if any(i + 1 in added for i in range(s["start"], s["end"] + 1)):
+                    hit = s["start"] + 1; break
+            if hit: bad.append((f, hit, "test: in-file unit test (cleanker.strip-tests)"))
     for _, _, tmp in blobs.values(): os.unlink(tmp)
     if not bad:
         return 0
     for f, line, why in bad:
-        print("cleanker: %s:%s: %s" % (f, line, why))
+        print("cleanker: %s%s: %s" % (f, ":%d" % line if line else "", why))
     print("cleanker: %d violation(s); `cleanker dry-run` previews the fix, `cleanker clean` writes it; CLEANKER_SKIP=1 or --no-verify bypasses" % len(bad))
     return 1
 
@@ -692,6 +1193,7 @@ def main():
         s.add_argument("--force", action="store_true", help="touch explicitly disabled repos and referenced docs")
         s.add_argument("--check", action="store_true", help="exit 1 when anything would change")
         s.add_argument("--file", action="append", default=[], help="restrict to these paths")
+        s.add_argument("--strip-tests", action="store_true", help="remove non-end-to-end tests (also cleanker.strip-tests)")
     for name in ("status","enroll","disenroll"):
         s = sub.add_parser(name)
         s.add_argument("paths", nargs="*", default=[])
@@ -729,20 +1231,26 @@ def main():
     total = collections.Counter()
     for path in repos:
         only = [os.path.abspath(x) for x in a.file] or None
-        ch = apply(path, dry=dry, fmt=a.format, force=a.force, only=only)
+        ch = apply(path, dry=dry, fmt=a.format, force=a.force, only=only,
+                   strip_tests=getattr(a, "strip_tests", False))
         n = collections.Counter(k for _, k, _ in ch)
         if not ch: continue
-        print("%-52s strip=%-4d md=%-3d referenced=%-3d legal=%-2d reject=%d" % (
+        rm_tests = sum(v for k, v in n.items() if k in {"rm-test","rm-test-gone"} or k == "test-wiring")
+        kept = sum(v for k, v in n.items() if k.startswith("keep-e2e") or k.startswith("keep-ref:"))
+        print("%-52s strip=%-4d md=%-3d tests=%-3d kept=%-3d referenced=%-3d legal=%-2d reject=%d" % (
             os.path.relpath(path, os.path.expanduser("~")), n["strip"], n["rm-md"],
-            n["keep-referenced"], n["keep-legal"], n["REJECT_SYNTAX"]))
+            rm_tests, kept, n["keep-referenced"], n["keep-legal"], n["REJECT_SYNTAX"]))
         for f, k, _ in ch:
             if k == "REJECT_SYNTAX": print("   rejected %s" % f)
+            if k.startswith(("keep-e2e", "keep-ref:")):
+                print("   kept %s (%s)" % (os.path.relpath(f, path), k.split(":",1)[-1]))
             if k in {"skip-not-enrolled", "skip-explicit-off"}:
                 print("   skipped: %s (use --force to override)" % k.replace("skip-", ""), end="\n")
         for k in n: total[k] += n[k]
     if dry: print("(dry run; nothing written)")
     print("total", dict(total))
-    if getattr(a, "check", False) and any(k in total for k in ("strip","rm-md")):
+    if getattr(a, "check", False) and any(
+            k in {"strip", "rm-md"} or k.startswith("rm-test") or k == "test-wiring" for k in total):
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -88,6 +88,43 @@ pkgs.stdenv.mkDerivation {
     grep -q 'Licensed under the GNU General Public License v3' "$tmp/g.c"
     grep -qx 'int x;' "$tmp/g.c"
     cleanker status > /dev/null
+    mkdir -p "$tmp/ts/tests" "$tmp/ts/src" "$tmp/ts/demo"
+    git -C "$tmp/ts" init -q
+    git -C "$tmp/ts" config user.email test@example.com
+    git -C "$tmp/ts" config user.name test
+    git -C "$tmp/ts" config --local cleanker.policy true
+    printf 'name = "demo"\nversion = "0.1.0"\n' > "$tmp/ts/pyproject.toml"
+    printf 'def add(a, b):\n    return a + b\n' > "$tmp/ts/demo/__init__.py"
+    printf 'import subprocess\n\n\ndef test_cli():\n    subprocess.run(["true"], check=True)\n' > "$tmp/ts/tests/test_cli.py"
+    printf 'pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 1), 2); }\n}\n' > "$tmp/ts/src/lib.rs"
+    printf 'pub fn run() {\n    std::process::Command::new("true").status().unwrap();\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn spawns() { super::run(); }\n}\n' > "$tmp/ts/src/spawn.rs"
+    git -C "$tmp/ts" add -A
+    git -C "$tmp/ts" -c core.hooksPath=/dev/null commit -qm init
+    printf 'from demo import add\n\n\ndef test_unit():\n    assert add(1, 2) == 3\n' > "$tmp/ts/tests/test_unit.py"
+    cleanker clean "$tmp/ts" > /dev/null
+    test -f "$tmp/ts/tests/test_unit.py"
+    test -f "$tmp/ts/tests/test_cli.py"
+    git -C "$tmp/ts" config --local cleanker.strip-tests true
+    if cleanker dry-run --check "$tmp/ts" > /dev/null; then
+      echo "cleanker check: --check did not report pending test removal" >&2
+      exit 1
+    fi
+    git -C "$tmp/ts" add tests/test_unit.py
+    if (cd "$tmp/ts" && ${pkgs.python3}/bin/python3 $src/cleanker.py hook); then
+      echo "cleanker check: gate did not block a staged unit test" >&2
+      exit 1
+    fi
+    git -C "$tmp/ts" reset -q tests/test_unit.py
+    cleanker clean "$tmp/ts" > /dev/null
+    test ! -f "$tmp/ts/tests/test_unit.py"
+    test -f "$tmp/ts/tests/test_cli.py"
+    grep -q 'pub fn add' "$tmp/ts/src/lib.rs"
+    if grep -q 'cfg(test)' "$tmp/ts/src/lib.rs"; then
+      echo "cleanker check: unit test block survived" >&2
+      exit 1
+    fi
+    grep -q 'cfg(test)' "$tmp/ts/src/spawn.rs"
+    ${pkgs.python3}/bin/python3 -m py_compile "$tmp/ts/tests/test_cli.py" "$tmp/ts/demo/__init__.py"
   '';
   installPhase = ''
     install -Dm755 $src/cleanker.py $out/libexec/cleanker.py
