@@ -574,8 +574,14 @@ def pre_push() -> int:
         if len(parts) < 4: continue
         local_sha, remote_sha = parts[1], parts[3]
         if set(local_sha) == {"0"}: continue
-        base = remote_sha if set(remote_sha) != {"0"} else empty
-        for f in git(top,"diff","--name-only","-z","%s..%s" % (base, local_sha)).stdout.split("\0"):
+        if set(remote_sha) != {"0"}:
+            out = git(top,"diff","--name-only","-z","%s..%s" % (remote_sha, local_sha)).stdout
+        elif git(top,"for-each-ref","--count=1","refs/remotes").stdout.strip():
+            out = git(top,"log","--format=","--name-only","-z",local_sha,"--not","--remotes").stdout
+        else:
+            out = git(top,"diff","--name-only","-z","%s..%s" % (empty, local_sha)).stdout
+        for f in out.split("\0"):
+            f = f.strip("\n")
             if f: changed.add(f)
     if not changed: return 0
     patterns = ignore_patterns(top)
