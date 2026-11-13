@@ -94,15 +94,19 @@ pkgs.stdenv.mkDerivation {
     git -C "$tmp/ts" config user.name test
     git -C "$tmp/ts" config --local cleanker.policy true
     printf 'name = "demo"\nversion = "0.1.0"\n' > "$tmp/ts/pyproject.toml"
-    printf 'def add(a, b):\n    return a + b\n' > "$tmp/ts/demo/__init__.py"
+    printf 'import subprocess\n\n\ndef add(a, b):\n    return a + b\n\n\ndef double(x):\n    return add(x, x)\n\n\ndef run_cli():\n    return subprocess.run(["true"], check=False).returncode\n\n\ndef exercise():\n    return run_cli()\n' > "$tmp/ts/demo/__init__.py"
     printf 'import subprocess\n\n\ndef test_cli():\n    subprocess.run(["true"], check=True)\n' > "$tmp/ts/tests/test_cli.py"
-    printf 'pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 1), 2); }\n}\n' > "$tmp/ts/src/lib.rs"
+    printf 'pub fn add(a: i32, b: i32) -> i32 { a + b }\n\npub fn double(x: i32) -> i32 { add(x, x) }\n\npub fn run_cli() -> bool {\n    std::process::Command::new("true").status().unwrap().success()\n}\n\npub fn exercise() -> bool { run_cli() }\n\npub struct Runner;\n\nimpl Runner {\n    pub fn go(&self) -> bool { run_cli() }\n}\n\n#[cfg(test)]\nmod add_tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 1), 2); }\n}\n\n#[cfg(test)]\nmod double_tests {\n    #[test]\n    fn doubles() { assert_eq!(super::double(2), 4); }\n}\n\n#[cfg(test)]\nmod chain_tests {\n    #[test]\n    fn chains() { super::exercise(); }\n}\n\n#[cfg(test)]\nmod method_tests {\n    #[test]\n    fn via_method() { let r = Runner; r.go(); }\n}\n\n#[cfg(test)]\nmod crate_tests {\n    #[test]\n    fn via_crate() { crate::exercise(); }\n}\n' > "$tmp/ts/src/lib.rs"
     printf 'pub fn run() {\n    std::process::Command::new("true").status().unwrap();\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn spawns() { super::run(); }\n}\n' > "$tmp/ts/src/spawn.rs"
     git -C "$tmp/ts" add -A
     git -C "$tmp/ts" -c core.hooksPath=/dev/null commit -qm init
     printf 'from demo import add\n\n\ndef test_unit():\n    assert add(1, 2) == 3\n' > "$tmp/ts/tests/test_unit.py"
+    printf 'from demo import double\n\n\ndef test_double():\n    assert double(2) == 4\n' > "$tmp/ts/tests/test_double.py"
+    printf 'from demo import exercise\n\n\ndef test_chain():\n    assert exercise() == 0\n' > "$tmp/ts/tests/test_chain.py"
     cleanker clean "$tmp/ts" > /dev/null
     test -f "$tmp/ts/tests/test_unit.py"
+    test -f "$tmp/ts/tests/test_double.py"
+    test -f "$tmp/ts/tests/test_chain.py"
     test -f "$tmp/ts/tests/test_cli.py"
     git -C "$tmp/ts" config --local cleanker.strip-tests true
     if cleanker dry-run --check "$tmp/ts" > /dev/null; then
@@ -117,14 +121,22 @@ pkgs.stdenv.mkDerivation {
     git -C "$tmp/ts" reset -q tests/test_unit.py
     cleanker clean "$tmp/ts" > /dev/null
     test ! -f "$tmp/ts/tests/test_unit.py"
+    test ! -f "$tmp/ts/tests/test_double.py"
+    test -f "$tmp/ts/tests/test_chain.py"
     test -f "$tmp/ts/tests/test_cli.py"
     grep -q 'pub fn add' "$tmp/ts/src/lib.rs"
-    if grep -q 'cfg(test)' "$tmp/ts/src/lib.rs"; then
+    if grep -q 'add_tests\|double_tests' "$tmp/ts/src/lib.rs"; then
       echo "cleanker check: unit test block survived" >&2
       exit 1
     fi
+    for kept in chain_tests method_tests crate_tests; do
+      if ! grep -q "$kept" "$tmp/ts/src/lib.rs"; then
+        echo "cleanker check: kept test block $kept was removed" >&2
+        exit 1
+      fi
+    done
     grep -q 'cfg(test)' "$tmp/ts/src/spawn.rs"
-    ${pkgs.python3}/bin/python3 -m py_compile "$tmp/ts/tests/test_cli.py" "$tmp/ts/demo/__init__.py"
+    ${pkgs.python3}/bin/python3 -m py_compile "$tmp/ts/tests/test_cli.py" "$tmp/ts/tests/test_chain.py" "$tmp/ts/demo/__init__.py"
   '';
   installPhase = ''
     install -Dm755 $src/cleanker.py $out/libexec/cleanker.py

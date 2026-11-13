@@ -412,8 +412,8 @@ TEST_STEM_RE = re.compile(r"^(?:test_.+|[^/]*_test|[^/]*[._-](?:test|spec)|tests
 TEST_PROJ_RE = re.compile(r"\.(?:tests?|specs?)$", re.I)
 EXT_LANG = {"jsx":"js","ts":"js","tsx":"js","mjs":"js","cjs":"js","bash":"sh","zsh":"sh","pyi":"py","fs":"cs"}
 SPAWN = {
-  "py": r"subprocess\.|os\.system\(|os\.exec[lv]p?e?|pexpect|pty\.spawn|requests\.(?:get|post|put|delete|patch|request)|urllib\.request|http\.client|http\.server|socket\.|socketserver|HTTPServer|BaseHTTPRequestHandler|uvicorn|gunicorn|flask|FastAPI|TestClient|playwright|selenium|docker|podman|qemu",
-  "rs": r"std::process::Command|process::Command|assert_cmd|Command::cargo_bin|CARGO_BIN_EXE_|escargot|duct::|reqwest|TcpStream|TcpListener|UnixListener|UdpSocket|hyper::|docker|podman|qemu",
+  "py": r"subprocess\.|os\.system\(|os\.exec[lv]p?e?|os\.(?:popen|spawn\w*|fork|kill|killpg)|commands\.getoutput|platform\.system|pexpect|pty\.spawn|requests\.(?:get|post|put|delete|patch|request)|urllib\.request|http\.client|http\.server|socket\.|socketserver|HTTPServer|BaseHTTPRequestHandler|uvicorn|gunicorn|flask|FastAPI|TestClient|playwright|selenium|docker|podman|qemu",
+  "rs": r"std::process::Command|process::Command|\bCommand\s*::\s*new\b|assert_cmd|Command::cargo_bin|CARGO_BIN_EXE_|escargot|duct::|reqwest|TcpStream|TcpListener|UnixListener|UdpSocket|hyper::|docker|podman|qemu",
   "go": r"os/exec|exec\.Command|httptest\.NewServer|http\.(?:Get|Post|Client|ListenAndServe)|net\.Listen|docker|podman|qemu",
   "js": r"child_process|execa\(|spawnSync\(|(?<![.\w])spawn\(|supertest|playwright|cypress|puppeteer|fetch\(|axios|createServer|listen\(",
   "cs": r"Process\.Start|ProcessStartInfo|HttpClient|WebApplicationFactory|HttpListener|TcpListener|Kestrel|Docker",
@@ -531,29 +531,105 @@ FUNC_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?(?:fn|def|func|function)\s+([A-
 STD_TYPES = {"String","Vec","Path","PathBuf","Duration","Instant","SystemTime","HashMap","BTreeMap","HashSet","BTreeSet",
              "OsStr","OsString","SocketAddr","IpAddr","Box","Arc","Rc","Cell","RefCell","Mutex","RwLock","Uuid","Regex",
              "Json","Value","Map","Seq","Number","Cow","Bytes","Chars","Iter","Option","Result","Range","VecDeque"}
+SAFE_CALLS |= set("""
+    unwrap expect expect_err unwrap_or unwrap_or_else unwrap_or_default unwrap_err ok_or ok_or_else map_err
+    and_then or_else map_or map_or_else filter_map flat_map flatten fold try_fold reduce sum product count
+    find find_map position rposition max min max_by min_by max_by_key min_by_key any all scan map filter
+    chain zip unzip enumerate peekable peek next next_back nth last step_by take take_while skip skip_while
+    inspect cloned copied rev cycle collect size_hint flatten dedup partition transpose replace_with then then_some
+    into matches to_bytes read_exact write_all flush path is_ok is_none is_some is_none_or is_some_and
+    is_multiple_of div_ceil div_floor unsigned_abs into_inner into_owned then_with as_millis as_micros
+    as_nanos as_secs subsec_nanos duration_since get_or_init get_or_try_init by_ref borrow_mut is_null
+
+    sort sort_unstable sort_by sort_by_key sort_unstable_by sort_unstable_by_key sort_by_cached_key
+    dedup_by dedup_by_key binary_search binary_search_by binary_search_by_key partition_point is_sorted
+    is_sorted_by is_sorted_by_key reverse rotate_left rotate_right swap swap_remove windows chunks
+    chunks_exact rchunks split_at split_at_mut concat join repeat fill fill_with
+
+    clone clone_from to_owned to_vec to_string into_bytes into_iter iter iter_mut drain
+    len is_empty capacity reserve try_reserve shrink_to_fit shrink_to truncate resize resize_with clear
+    push push_str push_back push_front pop pop_back pop_front front back first first_mut last last_mut
+    split_first split_last insert insert_str remove remove_entry retain extend extend_from_slice
+    extend_from_within append split_off make_contiguous as_slice as_mut_slice as_ref as_mut as_deref
+    as_deref_mut as_str as_bytes borrow to_lowercase to_uppercase to_ascii_lowercase to_ascii_uppercase
+    to_string_lossy eq_ignore_ascii_case make_ascii_lowercase make_ascii_uppercase
+
+    chars char_indices bytes split splitn rsplit rsplitn split_once rsplit_once split_whitespace
+    split_terminator split_inclusive lines starts_with ends_with find rfind replacen replace
+    trim trim_start trim_end trim_matches trim_start_matches trim_end_matches strip_prefix strip_suffix
+    is_char_boundary get get_mut get_or_insert get_or_insert_with contains contains_key entry
+    or_insert or_insert_with and_modify keys values values_mut
+
+    pow powi powf abs abs_diff signum is_positive is_negative rem_euclid div_euclid clamp total_cmp
+    checked_add checked_sub checked_mul checked_div checked_rem checked_pow checked_neg checked_abs
+    saturating_add saturating_sub saturating_mul saturating_div saturating_pow
+    wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_neg wrapping_shl wrapping_shr
+    overflowing_add overflowing_sub overflowing_mul overflowing_div
+    next_power_of_two ilog2 ilog10 count_ones count_zeros leading_zeros trailing_zeros leading_ones
+    trailing_ones swap_bytes reverse_bits to_le to_be from_le from_be is_power_of_two
+    to_le_bytes to_be_bytes to_ne_bytes from_le_bytes from_be_bytes from_ne_bytes
+    partial_cmp cmp eq ne is_nan is_infinite is_finite is_normal to_degrees to_radians
+    hypot atan2 exp ln log log2 log10 sin cos tan floor ceil round trunc fract sqrt cbrt mul_add
+    to_digit from_digit len_utf8 len_utf16 encode_utf8 escape_default escape_debug
+    is_alphanumeric is_alphabetic is_numeric is_ascii_digit is_ascii_alphabetic is_ascii_alphanumeric
+    is_ascii_whitespace is_ascii_uppercase is_ascii_lowercase is_ascii_hexdigit is_ascii_punctuation
+    is_ascii_graphic is_ascii_control is_uppercase is_lowercase is_whitespace is_control
+
+    sorted reversed enumerate sum min max abs round any all format startswith endswith
+    lower upper title capitalize casefold lstrip rstrip splitlines partition rpartition zfill ljust
+    rjust center expandtabs isdigit isalpha isalnum isspace isdecimal isnumeric isidentifier
+    index rindex remove discard add union intersection difference symmetric_difference issubset
+    issuperset isdisjoint bit_length is_integer oct fromhex conjugate real imag items update
+    setdefault popitem deepcopy dumps loads dump subTest skipTest setUp tearDown setUpClass tearDownClass
+
+    includes indexOf lastIndexOf slice splice forEach some every flat flatMap shift unshift
+    toString toFixed toPrecision padStart padEnd toUpperCase toLowerCase stringify has hasOwn
+""".split())
+STD_HEADS = STD_TYPES | {"File","OpenOptions","Read","Write","Seek","Cursor","Ordering","From","Into","TryFrom",
+             "TryInto","AsRef","AsMut","Default","Clone","Copy","Debug","Display","Iterator","IntoIterator",
+             "ToString","FromStr","AtomicUsize","AtomicBool","AtomicI32","Self","DateTime","Utc","NaiveDateTime",
+             "OnceLock","OnceCell","LazyLock","LazyCell","AtomicU8","AtomicU16","AtomicU64","AtomicI64",
+             "AtomicPtr","AtomicIsize","JoinHandle","PathBuf","OsString","CString",
+             "f32","f64","i8","i16","i32","i64","i128","u8","u16","u32","u64","u128","usize","isize","str","char","bool"}
+STD_MODULES = set("""
+    std core alloc thread env fs path fmt sync mem slice iter vec option result cmp hash borrow convert marker
+    ops ptr rc arc ascii num str string hint any cell refcell os sys json math re collections itertools
+    functools pathlib typing dataclasses datetime time random hashlib base64 copy abc enum io operator
+    statistics decimal fractions textwrap struct binascii zlib csv glob fnmatch heapq bisect array numbers
+    warnings traceback pprint difflib secrets hmac calendar uuid types unittest pytest contextlib weakref
+    queue logging platform packaging setuptools typing_extensions inspect
+    Math JSON Object Array Number String Boolean Promise Date console RegExp Map Set Reflect Intl
+""".split())
+AMBIG = object()
 STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+
+COMMENT_RE = re.compile(r"(?s)/\*.*?\*/|(?://|#(?![\[!]))[^\n]*")
+DEF_HEAD_RE = re.compile(r"(?:\b(?:class|def|struct|enum|trait|impl|interface|protocol|extension|namespace|object|type|fn|func|function|mod|const|static|let|var|record|union))\s+$")
 
 def calls_in(text):
     masked = STR_RE.sub('""', text)
+    masked = COMMENT_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), masked)
     out = []
     for m in CALL_RE.finditer(masked):
         before = masked[m.start()-1] if m.start() else ""
         if before in {"!", "[", "#", "@"}: continue
-        parts = [p.strip() for p in m.group(1).split("::")]
-        out.append((parts[-1], before == ".", len(parts) > 1 and parts[0][:1].isupper(), parts[0]))
+        if m.group(1).strip() == "pub": continue
+        if DEF_HEAD_RE.search(masked[max(0, m.start()-24):m.start()]): continue
+        out.append((m.group(1).split("::")[-1].strip(), [p.strip() for p in m.group(1).split("::")]))
     return out
 
 def function_map(repo):
-    fmap = {}
+    fmap = {"root": repo, "defs": {}, "files": set(), "mods": {}, "modules": None}
     exts = {"rs","py","zig","go","js","ts","tsx","jsx","mjs","cjs","cs","lisp","el","rb","lua"}
     for rel in tracked(repo):
         if ext_of(rel) not in exts or any(x in SKIP_DIRS for x in rel.split("/")): continue
         try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
         except OSError: continue
+        fmap["files"].add(rel)
         marks = [(m.start(), m.group(1) or m.group(2)) for m in FUNC_RE.finditer(text)]
         for i, (start, name) in enumerate(marks):
             stop = marks[i+1][0] if i + 1 < len(marks) else len(text)
-            fmap.setdefault(name, []).append((rel, bool(spawn_hit(rel, text[start:stop]))))
+            fmap["defs"].setdefault(name, []).append({"rel": rel, "start": start, "body": text[start:stop]})
     return fmap
 
 def module_of(rel):
@@ -581,28 +657,65 @@ def imported_modules(rel, text):
             mods.add(m.group(1).rsplit("/",1)[-1])
     return {m for m in mods if m}
 
-def spawns(name, rel, text, fmap, mods):
-    defs = fmap.get(name)
-    if not defs: return None
-    same = [s for r, s in defs if r == rel]
-    if same: return any(same)
-    near = [s for r, s in defs if module_of(r) in mods]
-    if near: return any(near)
-    return any(s for _, s in defs)
+def repo_modules(fmap):
+    mods = fmap.get("modules")
+    if mods is None:
+        mods = {module_of(rel) for rel in (fmap.get("files") or {})}
+        fmap["modules"] = mods
+    return mods
 
-def unit_proven(rel, text, fmap):
+def file_mods(fmap, rel):
+    cache = fmap.setdefault("mods", {})
+    if rel not in cache:
+        text = ""
+        try: text = open(os.path.join(fmap.get("root") or ".", rel), encoding="utf-8", errors="ignore").read()
+        except OSError: pass
+        cache[rel] = imported_modules(rel, text)
+    return cache[rel]
+
+def resolve_call(name, rel, fmap, qual=""):
+    lang = EXT_LANG.get(ext_of(rel), ext_of(rel))
+    defs = [d for d in ((fmap.get("defs") or {}).get(name) or ())
+            if EXT_LANG.get(ext_of(d["rel"]), ext_of(d["rel"])) == lang]
+    if qual and qual not in {"crate", "super", "self", "Self"}:
+        defs = [d for d in defs if module_of(d["rel"]) == qual]
+    if not defs: return None
+    pool = ([d for d in defs if d["rel"] == rel]
+            or [d for d in defs if module_of(d["rel"]) in file_mods(fmap, rel)]
+            or defs)
+    return pool[0] if len(pool) == 1 else AMBIG
+
+def follows_clean(d, fmap, stack, depth):
+    key = (d["rel"], d["start"])
+    if key in stack: return True
+    stack.add(key)
+    try: return traced_unit(d["rel"], d["body"], fmap, stack, depth + 1)
+    finally: stack.discard(key)
+
+def traced_unit(rel, text, fmap, stack, depth=0):
     if spawn_hit(rel, text): return False
-    mods = imported_modules(rel, text)
-    for name, method, type_path, head in calls_in(text):
-        if type_path and head in STD_TYPES: continue
-        hit = spawns(name, rel, text, fmap, mods)
-        if hit is True: return False
-        if hit is False: continue
-        if type_path: continue
-        if name in SAFE_CALLS or name[:1].isupper(): continue
-        if method: continue
+    if depth > 32: return False
+    for name, path in calls_in(text):
+        qual = path[-2] if len(path) > 1 else ""
+        if qual in {"", "crate", "super", "self", "Self"}:
+            d = resolve_call(name, rel, fmap, qual)
+            if d is AMBIG: return False
+            if d is None:
+                if not qual and (name in SAFE_CALLS or name in STD_HEADS or name.startswith("assert")): continue
+                return False
+            if not follows_clean(d, fmap, stack, depth): return False
+            continue
+        if qual in repo_modules(fmap):
+            d = resolve_call(name, rel, fmap, qual)
+            if d is None or d is AMBIG: return False
+            if not follows_clean(d, fmap, stack, depth): return False
+            continue
+        if qual in STD_MODULES or qual in STD_HEADS: continue
         return False
     return True
+
+def unit_proven(rel, text, fmap):
+    return traced_unit(rel, text, fmap, set())
 
 def classify_test(rel, text, names, fmap):
     named = e2e_named(rel)
