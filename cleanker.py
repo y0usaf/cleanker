@@ -554,46 +554,7 @@ SAFE_CALLS = {"new","from","default","parse","format","vec","Some","Ok","Err","N
               "for","if","while","match","loop","return","catch","with","switch","else","case","try","except","finally",
               "in","is","not","and","or","del","lambda","yield","await","raise","pass","global","nonlocal","let",
               "from_str","to_bytestring","try_from","try_into","id","from_utf8","to_str","as_bytes","sizeof"}
-SAFE_METHODS = set("""
-    unwrap expect expect_err unwrap_or unwrap_or_else unwrap_or_default unwrap_err ok_or ok_or_else map_err
-    and_then or_else map_or map_or_else filter_map flat_map flatten fold try_fold reduce sum product count
-    find find_map position rposition max min max_by min_by max_by_key min_by_key any all scan map filter
-    chain zip unzip enumerate peekable peek next next_back nth last step_by take take_while skip skip_while
-    cloned copied rev cycle collect size_hint dedup partition transpose replace_with then then_some
-    into matches to_bytes is_ok is_none is_some is_none_or is_some_and
-    is_multiple_of div_ceil div_floor unsigned_abs into_inner into_owned then_with
-    sort sort_unstable sort_by sort_by_key sort_unstable_by sort_unstable_by_key sort_by_cached_key
-    dedup_by dedup_by_key binary_search binary_search_by binary_search_by_key partition_point is_sorted
-    is_sorted_by is_sorted_by_key reverse rotate_left rotate_right windows chunks
-    chunks_exact rchunks split_at split_at_mut concat join repeat
-    clone clone_from to_owned to_vec to_string into_bytes into_iter iter iter_mut
-    len is_empty capacity as_slice as_mut_slice as_ref as_mut as_deref as_deref_mut as_str as_bytes
-    to_lowercase to_uppercase to_ascii_lowercase to_ascii_uppercase to_string_lossy eq_ignore_ascii_case
-    chars char_indices bytes split splitn rsplit rsplitn split_once rsplit_once split_whitespace
-    split_terminator split_inclusive lines starts_with ends_with rfind replacen replace
-    trim trim_start trim_end trim_matches trim_start_matches trim_end_matches strip_prefix strip_suffix
-    is_char_boundary contains contains_key keys values values_mut
-    pow powi powf abs abs_diff signum is_positive is_negative rem_euclid div_euclid clamp total_cmp
-    checked_add checked_sub checked_mul checked_div checked_rem checked_pow checked_neg checked_abs
-    saturating_add saturating_sub saturating_mul saturating_div saturating_pow
-    wrapping_add wrapping_sub wrapping_mul wrapping_div wrapping_rem wrapping_neg wrapping_shl wrapping_shr
-    overflowing_add overflowing_sub overflowing_mul overflowing_div
-    next_power_of_two ilog2 ilog10 count_ones count_zeros leading_zeros trailing_zeros leading_ones
-    trailing_ones swap_bytes reverse_bits to_le to_be from_le from_be is_power_of_two
-    to_le_bytes to_be_bytes to_ne_bytes from_le_bytes from_be_bytes from_ne_bytes
-    partial_cmp cmp eq ne is_nan is_infinite is_finite is_normal to_degrees to_radians
-    hypot atan2 exp ln log log2 log10 sin cos tan floor ceil round trunc fract sqrt cbrt mul_add
-    to_digit from_digit len_utf8 len_utf16 encode_utf8 escape_default escape_debug
-    is_alphanumeric is_alphabetic is_numeric is_ascii_digit is_ascii_alphabetic is_ascii_alphanumeric
-    is_ascii_whitespace is_ascii_uppercase is_ascii_lowercase is_ascii_hexdigit is_ascii_punctuation
-    is_ascii_graphic is_ascii_control is_uppercase is_lowercase is_whitespace is_control
-    format startswith endswith lower upper title capitalize casefold strip lstrip rstrip splitlines
-    partition rpartition zfill ljust rjust center expandtabs isdigit isalpha isalnum isspace isdecimal
-    isnumeric isidentifier union intersection difference symmetric_difference issubset issuperset
-    isdisjoint bit_length is_integer oct fromhex conjugate real imag items
-    includes indexOf lastIndexOf slice some every flat flatMap toString toFixed toPrecision
-    padStart padEnd toUpperCase toLowerCase stringify hasOwn
-""".split())
+
 CALL_RE = re.compile(r"([A-Za-z_]\w*(?:\s*(?:::|\.)\s*[A-Za-z_]\w*)*)\s*\(")
 FUNC_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?(?:fn|def|func|function)\s+([A-Za-z_]\w*)|(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_]\w*\s*=>)")
 
@@ -602,9 +563,13 @@ STD_TYPES = {"String","Vec","HashMap","BTreeMap","HashSet","BTreeSet","Box","Arc
 STD_HEADS = STD_TYPES | {"Ordering","From","Into","TryFrom","TryInto","AsRef","AsMut","Default","Clone","Copy",
              "Debug","Display","Iterator","IntoIterator","ToString","FromStr",
              "f32","f64","i8","i16","i32","i64","i128","u8","u16","u32","u64","u128","usize","isize","str","char","bool"}
-STD_MODULES = set("""
+RS_STD_MODULES = set("""
     core alloc fmt mem slice iter vec option result cmp hash borrow convert marker ops ptr rc arc ascii num str string hint any cell refcell
+""".split())
+PY_STD_MODULES = set("""
     json math re collections itertools functools dataclasses typing enum operator statistics decimal fractions textwrap struct binascii zlib csv fnmatch heapq bisect array numbers difflib hashlib hmac calendar uuid types contextlib typing_extensions
+""".split())
+JS_STD_MODULES = set("""
     Math JSON Object Array Number String Boolean RegExp Map Set Reflect Intl
 """.split())
 AMBIG = object()
@@ -710,13 +675,27 @@ def follows_clean(d, fmap, stack, depth):
     try: return traced_unit(d["rel"], d["body"], fmap, stack, depth + 1)
     finally: stack.discard(key)
 
+def std_receiver_ok(rel, path, name, dotted, fmap):
+    lang = EXT_LANG.get(ext_of(rel), ext_of(rel))
+    qual = path[-2] if len(path) > 1 else ""
+    if lang == "rs":
+        if not dotted and (qual in RS_STD_MODULES or qual in STD_HEADS):
+            return True
+        return False
+    if lang == "py":
+        if qual in PY_STD_MODULES and qual in file_mods(fmap, rel):
+            return not (qual == "json" and name in {"load", "dump"})
+        return False
+    if lang == "js":
+        return qual in JS_STD_MODULES
+    return False
+
 def traced_unit(rel, text, fmap, stack, depth=0):
     if spawn_hit(rel, text): return False
     if depth > 32: return False
     for name, path, dotted, chained in calls_in(text):
         qual = path[-2] if len(path) > 1 else ""
         if chained:
-            if name in SAFE_METHODS and name not in (fmap.get("defs") or {}): continue
             return False
         if qual == "":
             d = resolve_call(name, rel, fmap, qual)
@@ -736,10 +715,8 @@ def traced_unit(rel, text, fmap, stack, depth=0):
             if d is None or d is AMBIG: return False
             if not follows_clean(d, fmap, stack, depth): return False
             continue
-        if qual in STD_MODULES or qual in STD_HEADS:
-            if qual == "json" and name in {"load", "dump"}: return False
+        if std_receiver_ok(rel, path, name, dotted, fmap):
             continue
-        if dotted and name in SAFE_METHODS and name not in (fmap.get("defs") or {}): continue
         return False
     return True
 
