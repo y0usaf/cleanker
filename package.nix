@@ -235,6 +235,40 @@ pkgs.stdenv.mkDerivation {
               echo "cleanker check: esc_tests survived" >&2
               exit 1
             fi
+            mkdir -p "$tmp/ts/ignored"
+            printf 'ignored/\n' > "$tmp/ts/.cleankerignore"
+            printf '# keep ignored\nx = 1\n' > "$tmp/ts/ignored/gen.py"
+            printf 'import subprocess\n\ndef helper():\n    subprocess.run(["true"], check=False)\n' > "$tmp/ts/src/other.py"
+            printf 'def helper():\n    return 1\n\ndef test_local():\n    assert helper() == 1\n' > "$tmp/ts/src/mod.py"
+            git -C "$tmp/ts" add .cleankerignore ignored/gen.py src/other.py src/mod.py
+            cleanker clean "$tmp/ts" > /dev/null
+            grep -qx '# keep ignored' "$tmp/ts/ignored/gen.py"
+            if grep -q 'test_local' "$tmp/ts/src/mod.py"; then
+              echo "cleanker check: clean failed to resolve local helper in strip_test_blocks" >&2
+              exit 1
+            fi
+            mkdir -p "$tmp/push"
+            git -C "$tmp/push" init -q
+            git -C "$tmp/push" config user.email test@example.com
+            git -C "$tmp/push" config user.name test
+            git -C "$tmp/push" config --local cleanker.policy true
+            printf 'x = 1\n' > "$tmp/push/a.py"
+            git -C "$tmp/push" add a.py
+            git -C "$tmp/push" -c core.hooksPath=/dev/null commit -qm clean
+            clean_sha=$(git -C "$tmp/push" rev-parse HEAD)
+            printf '# dirty working tree\nx = 1\n' > "$tmp/push/a.py"
+            if ! (cd "$tmp/push" && printf 'refs/heads/main %s refs/heads/main 0000000000000000000000000000000000000000\n' "$clean_sha" | ${pkgs.python3}/bin/python3 "$src/cleanker.py" pre-push); then
+              echo "cleanker check: pre-push blocked clean commit due to dirty working tree" >&2
+              exit 1
+            fi
+            git -C "$tmp/push" add a.py
+            git -C "$tmp/push" -c core.hooksPath=/dev/null commit -qm dirty
+            dirty_sha=$(git -C "$tmp/push" rev-parse HEAD)
+            printf 'x = 1\n' > "$tmp/push/a.py"
+            if (cd "$tmp/push" && printf 'refs/heads/main %s refs/heads/main %s\n' "$dirty_sha" "$clean_sha" | ${pkgs.python3}/bin/python3 "$src/cleanker.py" pre-push); then
+              echo "cleanker check: pre-push allowed dirty commit due to clean working tree" >&2
+              exit 1
+            fi
             mkdir -p "$tmp/bin" "$tmp/ext"
             printf '#!/bin/sh\nexec %s/bin/python3 %s/cleanker.py "$@"\n' "${pkgs.python3}" "$src" > "$tmp/bin/cleanker"
             chmod +x "$tmp/bin/cleanker"

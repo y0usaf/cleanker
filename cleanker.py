@@ -92,10 +92,11 @@ def tracked(repo):
     p = git(repo,"ls-files","-z","--cached","--others","--exclude-standard")
     return [f for f in p.stdout.split("\0") if f]
 
-def lang_files(repo):
+def lang_files(repo, exclude=()):
     out = collections.defaultdict(list)
     for rel in tracked(repo):
         if any(part in SKIP_DIRS for part in rel.split("/")): continue
+        if exclude and ignored(exclude, rel): continue
         e = rel.rsplit(".",1)[-1].lower() if "." in os.path.basename(rel) else ""
         l = LANG_OF_EXT.get(e)
         if l: out[l].append(os.path.join(repo,rel))
@@ -387,7 +388,57 @@ def fmt_cmd(repo, lang, path):
         return [t,"format","--quiet",path] if t else None
     return None
 
-def corpus(top, files):
+def tree_entries(repo, sha):
+    p = subprocess.run(["git","-C",repo,"ls-tree","-r","-l","-z",sha], capture_output=True)
+    if p.returncode != 0: return {}
+    out = {}
+    for rec in p.stdout.split(b"\0"):
+        if not rec or b"\t" not in rec: continue
+        meta, path_b = rec.split(b"\t", 1)
+        parts = meta.decode("utf-8", "replace").split()
+        if len(parts) < 4: continue
+        mode, kind, oid, size_s = parts[0], parts[1], parts[2], parts[3]
+        if kind != "blob" or mode == "120000": continue
+        try: size = int(size_s)
+        except ValueError: continue
+        out[path_b.decode("utf-8", "replace")] = (oid, size)
+    return out
+
+def batch_blobs(repo, oids):
+    if not oids: return {}
+    uniq = list(dict.fromkeys(oids))
+    p = subprocess.run(["git","-C",repo,"cat-file","--batch"],
+                       input=("\n".join(uniq) + "\n").encode(), capture_output=True)
+    if p.returncode != 0: return {}
+    raw, pos, out = p.stdout, 0, {}
+    for oid in uniq:
+        nl = raw.find(b"\n", pos)
+        if nl < 0: break
+        hdr = raw[pos:nl].decode("utf-8", "replace")
+        pos = nl + 1
+        if hdr.endswith(" missing"): continue
+        parts = hdr.rsplit(" ", 2)
+        if len(parts) != 3: break
+        kind, size = parts[1], int(parts[2])
+        body = raw[pos:pos + size]
+        pos += size + 1
+        if kind == "blob": out[oid] = body
+    return out
+
+def corpus(top, files, blobs=None):
+    parts = []
+    for f in files:
+        if f.lower().endswith((".md",".mdx")): continue
+        if any(x in SKIP_DIRS for x in f.split("/")): continue
+        if blobs is not None:
+            if f in blobs and len(blobs[f]) <= 2_000_000: parts.append(blobs[f])
+            continue
+        p = os.path.join(top, f)
+        try:
+            if os.path.islink(p) or os.path.getsize(p) > 2_000_000: continue
+            with open(p, "rb") as fh: parts.append(fh.read())
+        except OSError: continue
+    return b"\n".join(parts)
     parts = []
     for f in files:
         if f.lower().endswith((".md",".mdx")): continue
@@ -494,14 +545,18 @@ def spawn_hit(rel, text):
         return "spawns a process or a server"
     return ""
 
-def project_names(repo):
+def project_names(repo, commit_files=None):
     names = set()
-    for rel in tracked(repo):
+    rels = list(commit_files.keys()) if commit_files is not None else tracked(repo)
+    for rel in rels:
         base = rel.rsplit("/",1)[-1]
         if base not in {"Cargo.toml","pyproject.toml","package.json"} and not base.endswith((".csproj",".fsproj")):
             continue
-        try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
-        except OSError: continue
+        if commit_files is not None:
+            text = commit_files[rel].decode("utf-8", "ignore")
+        else:
+            try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
+            except OSError: continue
         m = None
         if base == "Cargo.toml":
             m = re.search(r'(?ms)^\[package\].*?^name\s*=\s*"([^"]+)"', text)
@@ -514,7 +569,7 @@ def project_names(repo):
         if m:
             names.add(m.group(1))
             names.add(m.group(1).rsplit("/",1)[-1].replace("-", "_"))
-    for rel in tracked(repo):
+    for rel in rels:
         parts = rel.split("/")
         if parts[-1] == "__init__.py" and len(parts) > 1: names.add(parts[-2])
         if parts[0] == "src" and len(parts) > 2: names.add(parts[1])
@@ -594,10 +649,11 @@ def calls_in(text):
         out.append((parts[-1], parts, dotted, chained))
     return out
 
-def function_map(repo, overlay=None):
-    fmap = {"root": repo, "defs": {}, "files": set(), "mods": {}, "modules": None, "overlay": overlay or {}}
+def function_map(repo, overlay=None, exact=False):
+    fmap = {"root": repo, "defs": {}, "files": set(), "mods": {}, "modules": None, "overlay": overlay or {}, "exact": exact}
     exts = {"rs","py","zig","go","js","ts","tsx","jsx","mjs","cjs","cs","lisp","el","rb","lua"}
-    for rel in tracked(repo):
+    rels = list(overlay.keys()) if exact and overlay is not None else tracked(repo)
+    for rel in rels:
         if ext_of(rel) not in exts or any(x in SKIP_DIRS for x in rel.split("/")): continue
         if overlay and rel in overlay:
             text = overlay[rel]
@@ -649,6 +705,8 @@ def file_mods(fmap, rel):
         overlay = fmap.get("overlay") or {}
         if rel in overlay:
             text = overlay[rel]
+        elif fmap.get("exact"):
+            text = ""
         else:
             text = ""
             try: text = open(os.path.join(fmap.get("root") or ".", rel), encoding="utf-8", errors="ignore").read()
@@ -988,7 +1046,7 @@ def apply(repo, dry=False, fmt=False, force=False, only=None, strip_tests=False)
     deletes, keeps, edits = plan_tests(repo, exclude, only, fmap) if tests else ([], [], {})
     doomed = {os.path.join(repo, rel) for rel in deletes}
     hold = {p for p, kind, _ in keeps if kind.startswith(("keep-e2e", "keep-unknown", "keep-ref:"))}
-    lf = lang_files(repo)
+    lf = lang_files(repo, exclude)
     if only:
         scoped = set(os.path.abspath(x) for x in only)
         lf = {k: [f for f in v if f in scoped] for k, v in lf.items()}
@@ -1013,7 +1071,7 @@ def apply(repo, dry=False, fmt=False, force=False, only=None, strip_tests=False)
             ns = byfile.get(f, [])
             new = strip_src(src, ns, containers.get(f, ()))
             if tests and f not in hold:
-                new = strip_test_blocks(f, new, fmap)
+                new = strip_test_blocks(os.path.relpath(f, repo).replace(os.sep, "/"), new, fmap)
             if new != src:
                 edited[f] = new; orig[f] = src
         if not edited: continue
@@ -1154,11 +1212,15 @@ def enroll(paths, on):
         done.append((p, enrolled(p)))
     return done
 
-def ignore_patterns(top):
-    raw = git(top,"show",":.cleankerignore").stdout
-    if not raw:
-        path = os.path.join(top, ".cleankerignore")
-        raw = open(path).read() if os.path.exists(path) else ""
+def ignore_patterns(top, sha=None):
+    if sha:
+        p = git(top,"show","%s:.cleankerignore" % sha)
+        raw = p.stdout if p.returncode == 0 else ""
+    else:
+        raw = git(top,"show",":.cleankerignore").stdout
+        if not raw:
+            path = os.path.join(top, ".cleankerignore")
+            raw = open(path).read() if os.path.exists(path) else ""
     out = []
     for line in raw.splitlines():
         line = line.strip()
@@ -1172,7 +1234,7 @@ def pre_push() -> int:
     if not top or not enrolled(top): return 0
     if os.environ.get("CLEANKER_SKIP") == "1": return 0
     empty = git(top,"hash-object","-t","tree","/dev/null").stdout.strip()
-    changed = set()
+    by_sha = collections.defaultdict(set)
     for line in sys.stdin.read().splitlines():
         parts = line.split()
         if len(parts) < 4: continue
@@ -1186,44 +1248,75 @@ def pre_push() -> int:
             out = git(top,"diff","--name-only","-z","%s..%s" % (empty, local_sha)).stdout
         for f in out.split("\0"):
             f = f.strip("\n")
-            if f: changed.add(f)
-    if not changed: return 0
-    patterns = ignore_patterns(top)
-    files = [f for f in changed if not ignored(patterns, f) and not any(x in SKIP_DIRS for x in f.split("/"))]
-    lf = collections.defaultdict(list)
-    md = []
-    for f in files:
-        low = f.lower()
-        if low.endswith((".md",".mdx")):
-            if md_policy(f) == "drop": md.append(f)
-            continue
-        ext = low.rsplit(".",1)[-1] if "." in os.path.basename(low) else ""
-        lang = LANG_OF_EXT.get(ext)
-        full = os.path.join(top, f)
-        if lang and os.path.isfile(full): lf[lang].append(full)
-    nodes_by_file, _, _ = scan_all(lf)
+            if f: by_sha[local_sha].add(f)
+    if not by_sha: return 0
     bad = []
-    for f, nodes in nodes_by_file.items():
-        for n in nodes:
-            if classified(n["text"]) == "keep": continue
-            bad.append((os.path.relpath(f, top), n["text"].strip().splitlines()[0][:60]))
-    for m in md:
-        if refs_in(top, m): continue
-        bad.append((m, "unreferenced prose"))
-    if tests_on(top):
-        names = project_names(top)
-        fmap = function_map(top)
-        for f in files:
-            full = os.path.join(top, f)
-            try: text = open(full, encoding="utf-8", errors="ignore").read()
-            except OSError: continue
-            if test_candidate(f):
-                if classify_test(f, text, names, fmap)[0] == "unit":
-                    bad.append((f, "unit test (cleanker.strip-tests)"))
-                continue
-            if ext_of(f) not in {"rs","py","zig"} or e2e_named(f): continue
-            if any(unit_proven(f, s["text"], fmap) for s in test_spans(f, text)):
-                bad.append((f, "in-file unit test (cleanker.strip-tests)"))
+    tmps = []
+    check_tests = tests_on(top)
+    try:
+        for local_sha, changed in by_sha.items():
+            patterns = ignore_patterns(top, sha=local_sha)
+            entries = tree_entries(top, local_sha)
+            files = sorted(f for f in changed if f in entries and not ignored(patterns, f) and not any(x in SKIP_DIRS for x in f.split("/")))
+            if not files: continue
+            md = [f for f in files if f.lower().endswith((".md",".mdx")) and md_policy(f) == "drop"]
+            want = {entries[f][0] for f in files if not f.lower().endswith((".md",".mdx")) and entries[f][1] <= 2_000_000}
+            need_tree = bool(md or check_tests)
+            tree_blobs = {}
+            if need_tree:
+                for path, (oid, size) in entries.items():
+                    if size <= 2_000_000 and not any(x in SKIP_DIRS for x in path.split("/")):
+                        want.add(oid)
+            raw_oids = batch_blobs(top, list(want))
+            if need_tree:
+                for path, (oid, _) in entries.items():
+                    if oid in raw_oids: tree_blobs[path] = raw_oids[oid]
+            lf = collections.defaultdict(list)
+            tmp_of = {}
+            for f in files:
+                low = f.lower()
+                if low.endswith((".md",".mdx")): continue
+                ext = low.rsplit(".",1)[-1] if "." in os.path.basename(low) else ""
+                lang = LANG_OF_EXT.get(ext)
+                oid = entries[f][0]
+                if not lang or oid not in raw_oids: continue
+                fd, tmp = tempfile.mkstemp(suffix="." + ext)
+                os.close(fd)
+                with open(tmp,"wb") as fh: fh.write(raw_oids[oid])
+                tmps.append(tmp)
+                lf[lang].append(tmp)
+                tmp_of[tmp] = f
+            nodes_by_file, _, _ = scan_all(lf)
+            for tmp, nodes in nodes_by_file.items():
+                f = tmp_of.get(tmp)
+                if not f: continue
+                for n in nodes:
+                    if classified(n["text"]) == "keep": continue
+                    bad.append((f, n["text"].strip().splitlines()[0][:60]))
+            if md:
+                hay = corpus(top, list(tree_blobs.keys()), blobs=tree_blobs)
+                for m in md:
+                    if refs_in(top, m, blob=hay): continue
+                    bad.append((m, "unreferenced prose"))
+            if check_tests:
+                names = project_names(top, commit_files=tree_blobs)
+                overlay = {p: data.decode("utf-8", "ignore") for p, data in tree_blobs.items()}
+                fmap = function_map(top, overlay=overlay, exact=True)
+                for f in files:
+                    oid = entries[f][0]
+                    if oid not in raw_oids: continue
+                    text = raw_oids[oid].decode("utf-8", "ignore")
+                    if test_candidate(f):
+                        if classify_test(f, text, names, fmap)[0] == "unit":
+                            bad.append((f, "unit test (cleanker.strip-tests)"))
+                        continue
+                    if ext_of(f) not in {"rs","py","zig"} or e2e_named(f): continue
+                    if any(unit_proven(f, s["text"], fmap) for s in test_spans(f, text)):
+                        bad.append((f, "in-file unit test (cleanker.strip-tests)"))
+    finally:
+        for tmp in tmps:
+            try: os.unlink(tmp)
+            except OSError: pass
     if not bad: return 0
     for path, why in bad[:40]:
         print("cleanker: %s: %s" % (path, why))
