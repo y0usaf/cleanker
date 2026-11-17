@@ -1,5 +1,5 @@
 {
-  "name": "omp-cleanker",
+  "name": "cleanker",
   "version": "0.1.0",
   "description": "Runs cleanker at agent_end: strips new comments and unreferenced prose.",
   "license": "AGPL-3.0-only",
@@ -14,9 +14,13 @@
     "documentation",
     "policy"
   ],
+  "files": [
+    "extension.ts",
+    "README.md"
+  ],
   "pi": {
     "extensions": [
-      "./omp-extension.ts"
+      "./extension.ts"
     ]
   },
   "peerDependencies": {

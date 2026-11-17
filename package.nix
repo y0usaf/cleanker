@@ -302,64 +302,70 @@ pkgs.stdenv.mkDerivation {
             git -C "$tmp/ext" add -A
             git -C "$tmp/ext" -c core.hooksPath=/dev/null commit -qm init
             printf '# modified unrelated\nx = 1\n' > "$tmp/ext/dirty.py"
-            for ext_file in "$src/omp-cleanker/omp-extension.ts" "$src/pi-cleanker/pi-extension.ts"; do
-              git -C "$tmp/ext" reset -q HEAD -- dirty.py
-              printf '# agent comment\ny = 2\n' > "$tmp/ext/agent.py"
-              rm -f "$tmp/ext/bash_touched.py"
-              PATH="$tmp/bin:$PATH" ${pkgs.nodejs}/bin/node --input-type=module -e '
-                import { spawnSync } from "node:child_process";
-                import fs from "node:fs";
-                import path from "node:path";
-                const mod = (await import(process.argv[1])).default;
-                const cwd = process.argv[2];
-                const handlers = new Map();
-                const cmds = new Map();
-                const notes = [];
-                mod({
-                  registerCommand(name, def) { cmds.set(name, def); },
-                  on(ev, fn) { handlers.set(ev, fn); },
-                });
-                const ctx = { cwd, ui: { notify(msg, level) { notes.push({ msg, level }); } } };
-                await handlers.get("tool_result")({ toolName: "read", input: { path: "read_only.py" }, isError: false }, ctx);
-                if (!fs.readFileSync(path.join(cwd, "read_only.py"), "utf8").includes("# keep me")) {
-                  throw new Error("read tool_result modified read_only.py");
-                }
-                await handlers.get("tool_result")({ toolName: "write", input: { path: "agent.py" }, isError: false }, ctx);
-                if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
-                  throw new Error("write tool_result did not clean agent.py");
-                }
-                await handlers.get("tool_call")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" } }, ctx);
-                fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# bash comment\nb = 1\n");
-                spawnSync("git", ["-C", cwd, "add", "dirty.py"]);
-                await handlers.get("tool_result")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" }, isError: false }, ctx);
-                if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
-                  throw new Error("bash tool_result did not clean bash_touched.py");
-                }
-                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
-                  throw new Error("bash tool_result modified git-added unrelated dirty.py");
-                }
-                fs.writeFileSync(path.join(cwd, "agent.py"), "# later comment\ny = 2\n");
-                fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# later bash comment\nb = 1\n");
-                await handlers.get("agent_end")({}, ctx);
-                if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
-                  throw new Error("agent_end did not clean session-touched agent.py");
-                }
-                if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
-                  throw new Error("agent_end did not clean bash-touched bash_touched.py");
-                }
-                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
-                  throw new Error("agent_end modified unrelated dirty.py");
-                }
-                await handlers.get("agent_end")({}, ctx);
-                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
-                  throw new Error("empty agent_end modified unrelated dirty.py");
-                }
-                await cmds.get("cleanker").handler("dry-run --strip-tests", ctx);
-                if (!notes.some((n) => n.level === "info")) {
-                  throw new Error("cleanker command failed to split flags");
-                }
-              ' "$ext_file" "$tmp/ext"
-            done
+            mkdir -p "$tmp/pkg-src" "$tmp/packed"
+            cp "$src/package.json" "$src/extension.ts" "$src/README.md" "$tmp/pkg-src/"
+            tarball=$(${pkgs.nodejs}/bin/npm --offline --prefix "$tmp/pkg-src" pack "$tmp/pkg-src" --pack-destination "$tmp" | tail -n 1)
+            tar -xzf "$tmp/$tarball" -C "$tmp/packed"
+            ext_file=$(${pkgs.nodejs}/bin/node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const pkg = JSON.parse(fs.readFileSync(path.join(process.argv[1], "package/package.json"), "utf8"));
+              console.log(path.resolve(process.argv[1], "package", pkg.pi.extensions[0]));
+            ' "$tmp/packed")
+            printf '# agent comment\ny = 2\n' > "$tmp/ext/agent.py"
+            PATH="$tmp/bin:$PATH" ${pkgs.nodejs}/bin/node --input-type=module -e '
+              import { spawnSync } from "node:child_process";
+              import fs from "node:fs";
+              import path from "node:path";
+              const mod = (await import(process.argv[1])).default;
+              const cwd = process.argv[2];
+              const handlers = new Map();
+              const cmds = new Map();
+              const notes = [];
+              mod({
+                registerCommand(name, def) { cmds.set(name, def); },
+                on(ev, fn) { handlers.set(ev, fn); },
+              });
+              const ctx = { cwd, ui: { notify(msg, level) { notes.push({ msg, level }); } } };
+              await handlers.get("tool_result")({ toolName: "read", input: { path: "read_only.py" }, isError: false }, ctx);
+              if (!fs.readFileSync(path.join(cwd, "read_only.py"), "utf8").includes("# keep me")) {
+                throw new Error("read tool_result modified read_only.py");
+              }
+              await handlers.get("tool_result")({ toolName: "write", input: { path: "agent.py" }, isError: false }, ctx);
+              if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
+                throw new Error("write tool_result did not clean agent.py");
+              }
+              await handlers.get("tool_call")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" } }, ctx);
+              fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# bash comment\nb = 1\n");
+              spawnSync("git", ["-C", cwd, "add", "dirty.py"]);
+              await handlers.get("tool_result")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" }, isError: false }, ctx);
+              if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
+                throw new Error("bash tool_result did not clean bash_touched.py");
+              }
+              if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                throw new Error("bash tool_result modified git-added unrelated dirty.py");
+              }
+              fs.writeFileSync(path.join(cwd, "agent.py"), "# later comment\ny = 2\n");
+              fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# later bash comment\nb = 1\n");
+              await handlers.get("agent_end")({}, ctx);
+              if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
+                throw new Error("agent_end did not clean session-touched agent.py");
+              }
+              if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
+                throw new Error("agent_end did not clean bash-touched bash_touched.py");
+              }
+              if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                throw new Error("agent_end modified unrelated dirty.py");
+              }
+              await handlers.get("agent_end")({}, ctx);
+              if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                throw new Error("empty agent_end modified unrelated dirty.py");
+              }
+              await cmds.get("cleanker").handler("dry-run --strip-tests", ctx);
+              if (!notes.some((n) => n.level === "info")) {
+                throw new Error("cleanker command failed to split flags");
+              }
+            ' "$ext_file" "$tmp/ext" 
   '';
   installPhase = ''
     install -Dm755 $src/cleanker.py $out/libexec/cleanker.py
