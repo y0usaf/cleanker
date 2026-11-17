@@ -277,9 +277,22 @@ pkgs.stdenv.mkDerivation {
               echo "cleanker check: pre-push skipped >2MB commented source file" >&2
               exit 1
             fi
-            mkdir -p "$tmp/bin" "$tmp/ext"
+            mkdir -p "$tmp/bin" "$tmp/ext" "$tmp/fmt"
             printf '#!/bin/sh\nexec %s/bin/python3 %s/cleanker.py "$@"\n' "${pkgs.python3}" "$src" > "$tmp/bin/cleanker"
-            chmod +x "$tmp/bin/cleanker"
+            printf '#!/bin/sh\ntouch "%s/ruff-used"\n' "$tmp" > "$tmp/bin/ruff"
+            chmod +x "$tmp/bin/cleanker" "$tmp/bin/ruff"
+            git -C "$tmp/fmt" init -q
+            git -C "$tmp/fmt" config user.email test@example.com
+            git -C "$tmp/fmt" config user.name test
+            git -C "$tmp/fmt" config --local cleanker.policy true
+            printf '# fmt comment\nx = 1\n' > "$tmp/fmt/a.py"
+            git -C "$tmp/fmt" add a.py
+            PATH="$tmp/bin:$PATH" cleanker clean --format "$tmp/fmt" > /dev/null
+            if [ ! -e "$tmp/ruff-used" ]; then
+              echo "cleanker check: --format did not use ruff from PATH" >&2
+              exit 1
+            fi
+            grep -qx 'x = 1' "$tmp/fmt/a.py"
             git -C "$tmp/ext" init -q
             git -C "$tmp/ext" config user.email test@example.com
             git -C "$tmp/ext" config user.name test
@@ -290,8 +303,11 @@ pkgs.stdenv.mkDerivation {
             git -C "$tmp/ext" -c core.hooksPath=/dev/null commit -qm init
             printf '# modified unrelated\nx = 1\n' > "$tmp/ext/dirty.py"
             for ext_file in "$src/omp-cleanker/omp-extension.ts" "$src/pi-cleanker/pi-extension.ts"; do
+              git -C "$tmp/ext" reset -q HEAD -- dirty.py
               printf '# agent comment\ny = 2\n' > "$tmp/ext/agent.py"
+              rm -f "$tmp/ext/bash_touched.py"
               PATH="$tmp/bin:$PATH" ${pkgs.nodejs}/bin/node --input-type=module -e '
+                import { spawnSync } from "node:child_process";
                 import fs from "node:fs";
                 import path from "node:path";
                 const mod = (await import(process.argv[1])).default;
@@ -312,10 +328,24 @@ pkgs.stdenv.mkDerivation {
                 if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
                   throw new Error("write tool_result did not clean agent.py");
                 }
+                await handlers.get("tool_call")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" } }, ctx);
+                fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# bash comment\nb = 1\n");
+                spawnSync("git", ["-C", cwd, "add", "dirty.py"]);
+                await handlers.get("tool_result")({ toolCallId: "b1", toolName: "bash", input: { command: "write bash_touched.py" }, isError: false }, ctx);
+                if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
+                  throw new Error("bash tool_result did not clean bash_touched.py");
+                }
+                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                  throw new Error("bash tool_result modified git-added unrelated dirty.py");
+                }
                 fs.writeFileSync(path.join(cwd, "agent.py"), "# later comment\ny = 2\n");
+                fs.writeFileSync(path.join(cwd, "bash_touched.py"), "# later bash comment\nb = 1\n");
                 await handlers.get("agent_end")({}, ctx);
                 if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
                   throw new Error("agent_end did not clean session-touched agent.py");
+                }
+                if (fs.readFileSync(path.join(cwd, "bash_touched.py"), "utf8").trim() !== "b = 1") {
+                  throw new Error("agent_end did not clean bash-touched bash_touched.py");
                 }
                 if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
                   throw new Error("agent_end modified unrelated dirty.py");

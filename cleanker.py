@@ -362,13 +362,18 @@ def strip_src(src, nodes, containers=()):
 
 BINS = "/tmp/cleanker/bins"
 def tool(name, attr):
+    found = shutil.which(name)
+    if found: return found
     os.makedirs(BINS, exist_ok=True)
     cache = os.path.join(BINS, name)
-    if not os.path.exists(cache):
-        p = subprocess.run(["nix","build","--no-link","--print-out-paths",attr], capture_output=True, text=True)
-        if p.returncode != 0: return None
-        open(cache,"w").write(p.stdout.strip())
-    root = open(cache).read().strip()
+    if os.path.exists(cache):
+        root = open(cache).read().strip()
+        for cand in (os.path.join(root,"bin",name), os.path.join(root,name)):
+            if os.path.exists(cand): return cand
+    p = subprocess.run(["nix","build","--no-link","--print-out-paths",attr], capture_output=True, text=True)
+    if p.returncode != 0: return None
+    root = p.stdout.strip()
+    open(cache,"w").write(root)
     for cand in (os.path.join(root,"bin",name), os.path.join(root,name)):
         if os.path.exists(cand): return cand
     return None
@@ -378,7 +383,7 @@ def fmt_cmd(repo, lang, path):
         t = tool("rustfmt","nixpkgs#rustfmt")
         return [t,"--edition","2021",path] if t else None
     if lang in {"TypeScript","Tsx","JavaScript"}:
-        t = tool("biome","nixpkgs#biome") or shutil.which("biome")
+        t = tool("biome","nixpkgs#biome")
         return [t,"format","--write",path] if t else None
     if lang == "Nix":
         t = tool("nixfmt","nixpkgs#nixfmt")
