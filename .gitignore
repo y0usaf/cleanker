@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.ast-grep
+ast-grep-root
+result

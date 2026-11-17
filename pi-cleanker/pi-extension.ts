@@ -3,14 +3,16 @@ import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const READ_TOOLS = new Set(["read", "grep", "find", "ls", "view_file"]);
+
 const run = (cwd: string, args: string[]) => {
   const r = spawnSync("cleanker", args, { cwd, encoding: "utf8" });
   return { code: r.status ?? 2, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 };
 
 const counts = (out: string) => {
-  const m = out.match(/strip=(\d+)\s+md=(\d+)/);
-  return m ? Number(m[1]) + Number(m[2]) : 0;
+  const m = out.match(/strip=(\d+)\s+md=(\d+)(?:\s+tests=(\d+))?/);
+  return m ? Number(m[1]) + Number(m[2]) + Number(m[3] ?? 0) : 0;
 };
 
 const written = (input: unknown): string | undefined => {
@@ -27,8 +29,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("cleanker", {
     description: "Run cleanker: status, dry-run, or clean",
     handler: async (args, ctx) => {
-      const sub = String(args ?? "").trim() || "status";
-      const { code, out } = run(ctx.cwd, [sub]);
+      const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+      const { code, out } = run(ctx.cwd, parts.length > 0 ? parts : ["status"]);
       const text = out.trim() || "no output";
       ctx.ui.notify(text.split("\n").slice(0, 12).join("\n"), code === 0 ? "info" : "warning");
     },
@@ -38,6 +40,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_result", async (event, ctx) => {
     if (!event || event.isError) return;
+    if (typeof event.toolName === "string" && READ_TOOLS.has(event.toolName)) return;
     const rel = written(event.input);
     if (!rel) return;
     const abs = isAbsolute(rel) ? rel : join(ctx.cwd, rel);

@@ -7,10 +7,11 @@ OWN_OWNERS = {"y0usaf","sylvarant-ai","Inscendai","thepresciencecompany","shodow
 LANG_OF_EXT = {"py":"Python","pyi":"Python","rs":"Rust","ts":"TypeScript","tsx":"Tsx","js":"JavaScript",
   "jsx":"JavaScript","mjs":"JavaScript","cjs":"JavaScript","go":"Go","nix":"Nix","lua":"Lua","c":"C","h":"C",
   "cpp":"Cpp","cc":"Cpp","hpp":"Cpp","cxx":"Cpp","cs":"CSharp","zig":"Zig","sh":"Bash","bash":"Bash","rb":"Ruby",
-  "swift":"Swift","kt":"Kotlin","scala":"Scala","ex":"Elixir","exs":"Elixir","hs":"Haskell","php":"Php","dart":"Dart",
+  "swift":"Swift","kt":"Kotlin","java":"Java","scala":"Scala","ex":"Elixir","exs":"Elixir","hs":"Haskell","php":"Php","dart":"Dart",
   "css":"Css","html":"Html","htm":"Html","yml":"Yaml","yaml":"Yaml"}
 KINDS = {"Rust":["line_comment","block_comment"],"Java":["line_comment","block_comment"],
-         "Kotlin":["line_comment"],"Scala":["comment","block_comment"],"Dart":["comment","block_comment"]}
+         "Kotlin":["line_comment","multiline_comment"],"Swift":["comment","multiline_comment"],
+         "Scala":["comment","block_comment"],"Dart":["comment","block_comment"]}
 DIRECTIVE = [
   r"^#!", r"^//go:", r"^//\+build", r"^#\s*type:", r"^#\s*noqa", r"^#\s*fmt:", r"^#\s*isort:",
   r"^#\s*pyright:", r"^#\s*mypy:", r"coding[:=]", r"^#\s*pylint:", r"^#\s*pragma:",
@@ -37,8 +38,9 @@ def ag():
     found = shutil.which("ast-grep")
     if found:
         _ag = found; return _ag
-    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ast-grep")
-    link = os.path.join(os.path.dirname(cache), "ast-grep-root")
+    os.makedirs(BINS, exist_ok=True)
+    cache = os.path.join(BINS, "ast-grep.path")
+    link = os.path.join(BINS, "ast-grep-root")
     if os.path.exists(cache):
         path = open(cache).read().strip()
         if os.path.exists(path): _ag = path; return _ag
@@ -142,58 +144,60 @@ def scan_rule(files, rules):
                 except ValueError: pass
     return out
 
-PY_DOC = "id: d_Python\nlanguage: Python\nrule:\n  kind: expression_statement\n  has:\n    kind: string\n    stopBy: end\n"
-
 def scan_all(by_lang):
     langs = [k for k, v in by_lang.items() if v]
     out = collections.defaultdict(list)
     errs = collections.Counter()
     containers = collections.defaultdict(list)
     if not langs: return out, errs, containers
-    rules, files = [], []
+    file_lang = {}
+    files = []
     for lang in langs:
-        ks = KINDS.get(lang, ["comment"])
-        rules.append("id: c_%s\nlanguage: %s\nrule:\n  any:\n%s" % (lang, lang, "".join("    - kind: %s\n" % k for k in ks)))
-        rules.append("id: e_%s\nlanguage: %s\nrule:\n  kind: ERROR\n" % (lang, lang))
-        if lang == "Tsx":
-            rules.append("id: j_%s\nlanguage: %s\nrule:\n  kind: jsx_expression\n" % (lang, lang))
-        if lang == "Python":
-            rules.append(PY_DOC)
-        files.extend(by_lang[lang])
-    p = sh([ag(),"scan","--inline-rules","\n---\n".join(rules),"--json=stream",*files])
-    if p.returncode != 0 and not p.stdout.strip():
-        for lang in langs:
-            for n in scan(by_lang[lang], lang): out[n["file"]].append(n)
-            for n in scan(by_lang[lang], lang, ["ERROR"]): errs[n["file"]] += 1
+        for f in by_lang[lang]:
+            file_lang[f] = lang
+            files.append(f)
+    for part in chunks(files):
+        part_langs = []
+        for f in part:
+            l = file_lang[f]
+            if l not in part_langs: part_langs.append(l)
+        rules = []
+        for lang in part_langs:
+            ks = KINDS.get(lang, ["comment"])
+            rules.append("id: c_%s\nlanguage: %s\nrule:\n  any:\n%s" % (lang, lang, "".join("    - kind: %s\n" % k for k in ks)))
+            rules.append("id: e_%s\nlanguage: %s\nrule:\n  kind: ERROR\n" % (lang, lang))
             if lang == "Tsx":
-                for c in scan(by_lang[lang], lang, ["jsx_expression"]): containers[c["file"]].append(c)
-            if lang == "Python":
-                for n in scan_rule(by_lang[lang], PY_DOC): n["doc"] = True; out[n["file"]].append(n)
-    else:
-        for line in p.stdout.splitlines():
-            if '"ruleId"' not in line: continue
-            try: n = json.loads(line)
-            except ValueError: continue
-            rid = n["ruleId"]
-            if rid.startswith("e_"): errs[n["file"]] += 1
-            elif rid.startswith("j_"): containers[n["file"]].append(n)
-            elif rid.startswith("d_"): n["doc"] = True; out[n["file"]].append(n)
-            else: out[n["file"]].append(n)
+                rules.append("id: j_%s\nlanguage: %s\nrule:\n  kind: jsx_expression\n" % (lang, lang))
+        p = sh([ag(),"scan","--inline-rules","\n---\n".join(rules),"--json=stream",*part])
+        if p.returncode != 0 and not p.stdout.strip():
+            by_part = collections.defaultdict(list)
+            for f in part: by_part[file_lang[f]].append(f)
+            for lang in part_langs:
+                for n in scan(by_part[lang], lang): out[n["file"]].append(n)
+                for n in scan(by_part[lang], lang, ["ERROR"]): errs[n["file"]] += 1
+                if lang == "Tsx":
+                    for c in scan(by_part[lang], lang, ["jsx_expression"]): containers[c["file"]].append(c)
+        else:
+            for line in p.stdout.splitlines():
+                if '"ruleId"' not in line: continue
+                try: n = json.loads(line)
+                except ValueError: continue
+                rid = n["ruleId"]
+                if rid.startswith("e_"): errs[n["file"]] += 1
+                elif rid.startswith("j_"): containers[n["file"]].append(n)
+                else: out[n["file"]].append(n)
     for lang in langs:
         for n in embedded(by_lang[lang], lang): out[n["file"]].append(n)
-    cand = {n["file"] for ns in out.values() for n in ns if n.get("doc")}
-    docs = py_docs(cand)
-    for f, ns in out.items():
-        if f not in cand: continue
-        table = docs.get(f, {})
-        keep = []
-        for n in ns:
-            if not n.get("doc"):
-                keep.append(n); continue
-            at = n["range"]["byteOffset"]["start"]
-            if at not in table: continue
-            n["replace"] = table[at]; keep.append(n)
-        out[f] = keep
+    for f, nodes in py_docs(by_lang.get("Python", ())).items():
+        out[f].extend(nodes)
+    for f, ns in list(out.items()):
+        seen, dedup = set(), []
+        for n in sorted(ns, key=lambda x: (x["range"]["byteOffset"]["start"], -x["range"]["byteOffset"]["end"], 0 if x.get("doc") else 1)):
+            span = (n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
+            if span in seen: continue
+            seen.add(span)
+            dedup.append(n)
+        out[f] = dedup
     return out, errs, containers
 
 def py_docs(files):
@@ -204,7 +208,7 @@ def py_docs(files):
             tree = ast.parse(data)
         except (OSError, SyntaxError, ValueError):
             continue
-        starts, off, table = [0], 0, {}
+        starts, off, nodes = [0], 0, []
         for line in data.split(b"\n"):
             off += len(line) + 1; starts.append(off)
         stack = [tree]
@@ -215,8 +219,16 @@ def py_docs(files):
             if not n.body: continue
             d = n.body[0]
             if not (isinstance(d, ast.Expr) and isinstance(d.value, ast.Constant) and isinstance(d.value.value, str)): continue
-            table[starts[d.lineno - 1] + d.col_offset] = "pass" if len(n.body) == 1 else ""
-        if table: out[f] = table
+            s = starts[d.lineno - 1] + d.col_offset
+            e = starts[d.end_lineno - 1] + d.end_col_offset
+            rep = "pass" if len(n.body) == 1 else ""
+            if not rep:
+                m = re.match(rb"[ \t]*;[ \t]*", data[e:])
+                if m: e += m.end()
+            nodes.append({"file": f, "text": data[s:e].decode("utf-8", "replace"),
+                          "range": {"byteOffset": {"start": s, "end": e}},
+                          "doc": True, "replace": rep})
+        if nodes: out[f] = nodes
     return out
 
 EMBED = {"Html": [("JavaScript","script_element","js"), ("Css","style_element","css")]}
@@ -266,37 +278,56 @@ def strip_src(src, nodes, containers=()):
         return starts[k] + len(lines[k])
     cuts = collections.defaultdict(list)
     dropped = set()
-    verdict = {id(n): classified(n["text"]) for n in nodes}
+    uniq, seen_spans = [], set()
+    for n in sorted(nodes, key=lambda x: (x["range"]["byteOffset"]["start"], -x["range"]["byteOffset"]["end"])):
+        sp = (n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
+        if sp in seen_spans: continue
+        seen_spans.add(sp)
+        uniq.append(n)
+    verdict = {id(n): classified(n["text"]) for n in uniq}
     kept = [(n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
-            for n in nodes if verdict[id(n)] == "keep"]
+            for n in uniq if verdict[id(n)] == "keep"]
     drops = [(n["range"]["byteOffset"]["start"], n["range"]["byteOffset"]["end"])
-             for n in nodes if verdict[id(n)] == "drop"]
-    for n in nodes:
+             for n in uniq if verdict[id(n)] == "drop"]
+    covered = []
+    for n in uniq:
         if verdict[id(n)] == "keep": continue
         s = n["range"]["byteOffset"]["start"]; e = n["range"]["byteOffset"]["end"]
+        if any(a <= s and e <= b for a, b in covered): continue
         inner = [c for c in containers
                  if c["range"]["byteOffset"]["start"] <= s and e <= c["range"]["byteOffset"]["end"]]
         if inner:
             c = min(inner, key=lambda k: k["range"]["byteOffset"]["end"] - k["range"]["byteOffset"]["start"])
             cs0, ce0 = c["range"]["byteOffset"]["start"], c["range"]["byteOffset"]["end"]
-            inside = data[cs0:ce0]
-            for a, b in kept + drops:
-                if cs0 <= a and b <= ce0: inside = inside.replace(data[a:b], b"", 1)
-            if inside.replace(b"{", b"").replace(b"}", b"").strip() == b"":
-                s, e = cs0, ce0
+            if not any(cs0 <= a and b <= ce0 for a, b in kept):
+                rem, pos = [], cs0
+                for a, b in sorted(drops):
+                    if cs0 <= a and b <= ce0:
+                        if a > pos: rem.append(data[pos:a])
+                        pos = max(pos, b)
+                if pos < ce0: rem.append(data[pos:ce0])
+                if b"".join(rem).replace(b"{", b"").replace(b"}", b"").strip() == b"":
+                    s, e = cs0, ce0
+        if any(not (e <= a or b <= s) for a, b in covered): continue
+        covered.append((s, e))
         rep = (n.get("replace") or "").encode()
         i, j = span(s, e)
         if rep:
-            cuts[i].append((s - starts[i], len(lines[i]), rep))
-            if i < j and data[e:line_end(j)].strip():
-                cuts[j].append((0, e - starts[j], b"")); dropped.update(range(i + 1, j))
+            if i == j:
+                cuts[i].append((s - starts[i], e - starts[i], rep))
             else:
+                tail = data[e:line_end(j)]
+                cuts[i].append((s - starts[i], len(lines[i]), rep + (tail if tail.strip() else b"")))
                 dropped.update(range(i + 1, j + 1))
             continue
         if i == j and data[starts[i]:s].strip() == b"" and data[e:line_end(i)].strip() == b"":
             dropped.add(i); continue
         if i < j and data[starts[i]:s].strip() == b"" and data[e:line_end(j)].strip() == b"":
             dropped.update(range(i, j + 1)); continue
+        if i < j and data[starts[i]:s].strip() == b"" and data[e:line_end(j)].strip() != b"":
+            dropped.update(range(i, j))
+            cuts[j].append((0, e - starts[j], data[starts[i]:s]))
+            continue
         k = i
         while k <= j:
             lo = s if k == i else starts[k]
@@ -317,7 +348,7 @@ def strip_src(src, nodes, containers=()):
                 if rep:
                     l = left + rep + right
                 elif left.rstrip() and right.lstrip():
-                    l = left + b" " + right
+                    l = left + (b"" if left.endswith((b" ", b"\t")) or right.startswith((b" ", b"\t")) else b" ") + right
                 else:
                     l = left + right
             cr = b"\r" if lines[i].endswith(b"\r") else b""
@@ -513,53 +544,35 @@ def internal_ref(rel, text, names):
         return bool(re.search(r"@import\(\"([^\"]*src|[^\"]*cwd|[^\"]*root)", text))
     return False
 
-SAFE_CALLS = {"new","from","default","parse","open","load","read","write","format","vec","Some","Ok","Err","None","String",
-              "Vec","Path","PathBuf","Duration","range","len","print","println","drop","assert","require","import","str",
-              "int","float","list","dict","set","tuple","bool","isinstance","getattr","setattr","hasattr","super","self",
-              "test","it","describe","beforeEach","afterEach","before","after","expect","jest","vi","mock","fn","spyOn",
-              "pytest","fixture","parametrize","raises","mark","skip","xfail","assert_equal","assert_raises","deftest",
+SAFE_CALLS = {"new","from","default","parse","format","vec","Some","Ok","Err","None","String","Vec",
+              "range","len","str","int","float","list","dict","set","tuple","bool","isinstance","issubclass",
+              "abs","min","max","sum","any","all","sorted","reversed","enumerate","zip","map","filter","round",
+              "ord","chr","hex","bin","repr","slice","pow","divmod","super",
+              "test","it","describe","beforeEach","afterEach","before","after","expect","assert","assert_eq",
+              "assert_ne","debug_assert","debug_assert_eq","debug_assert_ne","assert_matches","assert_equal",
+              "assert_raises","deftest","raises","parametrize","skip","xfail",
               "for","if","while","match","loop","return","catch","with","switch","else","case","try","except","finally",
-              "in","is","not","and","or","del","lambda","yield","await","raise","pass","global","nonlocal","assert_eq",
-              "let","create_dir","create_dir_all","remove_dir_all","remove_file","read_dir","metadata","canonicalize",
-              "temp_dir","current_dir","set_var","var","sleep","now","elapsed","from_secs","from_millis","exists",
-              "is_file","is_dir","to_path_buf","display","with_extension","set_extension","parent","file_name","components",
-              "read_to_string","copy","rename","join_paths","env_var","args_os","exit","stdin","stdout","stderr",
-              "from_str","to_bytestring","try_from","try_into","id","from_utf8","to_str","as_bytes","write_all"}
-CALL_RE = re.compile(r"([A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)\s*\(")
-FUNC_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?(?:fn|def|func|function)\s+([A-Za-z_]\w*)|(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_]\w*\s*=>)")
-
-STD_TYPES = {"String","Vec","Path","PathBuf","Duration","Instant","SystemTime","HashMap","BTreeMap","HashSet","BTreeSet",
-             "OsStr","OsString","SocketAddr","IpAddr","Box","Arc","Rc","Cell","RefCell","Mutex","RwLock","Uuid","Regex",
-             "Json","Value","Map","Seq","Number","Cow","Bytes","Chars","Iter","Option","Result","Range","VecDeque"}
-SAFE_CALLS |= set("""
+              "in","is","not","and","or","del","lambda","yield","await","raise","pass","global","nonlocal","let",
+              "from_str","to_bytestring","try_from","try_into","id","from_utf8","to_str","as_bytes","sizeof"}
+SAFE_METHODS = set("""
     unwrap expect expect_err unwrap_or unwrap_or_else unwrap_or_default unwrap_err ok_or ok_or_else map_err
     and_then or_else map_or map_or_else filter_map flat_map flatten fold try_fold reduce sum product count
     find find_map position rposition max min max_by min_by max_by_key min_by_key any all scan map filter
     chain zip unzip enumerate peekable peek next next_back nth last step_by take take_while skip skip_while
-    inspect cloned copied rev cycle collect size_hint flatten dedup partition transpose replace_with then then_some
-    into matches to_bytes read_exact write_all flush path is_ok is_none is_some is_none_or is_some_and
-    is_multiple_of div_ceil div_floor unsigned_abs into_inner into_owned then_with as_millis as_micros
-    as_nanos as_secs subsec_nanos duration_since get_or_init get_or_try_init by_ref borrow_mut is_null
-
+    cloned copied rev cycle collect size_hint dedup partition transpose replace_with then then_some
+    into matches to_bytes is_ok is_none is_some is_none_or is_some_and
+    is_multiple_of div_ceil div_floor unsigned_abs into_inner into_owned then_with
     sort sort_unstable sort_by sort_by_key sort_unstable_by sort_unstable_by_key sort_by_cached_key
     dedup_by dedup_by_key binary_search binary_search_by binary_search_by_key partition_point is_sorted
-    is_sorted_by is_sorted_by_key reverse rotate_left rotate_right swap swap_remove windows chunks
-    chunks_exact rchunks split_at split_at_mut concat join repeat fill fill_with
-
-    clone clone_from to_owned to_vec to_string into_bytes into_iter iter iter_mut drain
-    len is_empty capacity reserve try_reserve shrink_to_fit shrink_to truncate resize resize_with clear
-    push push_str push_back push_front pop pop_back pop_front front back first first_mut last last_mut
-    split_first split_last insert insert_str remove remove_entry retain extend extend_from_slice
-    extend_from_within append split_off make_contiguous as_slice as_mut_slice as_ref as_mut as_deref
-    as_deref_mut as_str as_bytes borrow to_lowercase to_uppercase to_ascii_lowercase to_ascii_uppercase
-    to_string_lossy eq_ignore_ascii_case make_ascii_lowercase make_ascii_uppercase
-
+    is_sorted_by is_sorted_by_key reverse rotate_left rotate_right windows chunks
+    chunks_exact rchunks split_at split_at_mut concat join repeat
+    clone clone_from to_owned to_vec to_string into_bytes into_iter iter iter_mut
+    len is_empty capacity as_slice as_mut_slice as_ref as_mut as_deref as_deref_mut as_str as_bytes
+    to_lowercase to_uppercase to_ascii_lowercase to_ascii_uppercase to_string_lossy eq_ignore_ascii_case
     chars char_indices bytes split splitn rsplit rsplitn split_once rsplit_once split_whitespace
-    split_terminator split_inclusive lines starts_with ends_with find rfind replacen replace
+    split_terminator split_inclusive lines starts_with ends_with rfind replacen replace
     trim trim_start trim_end trim_matches trim_start_matches trim_end_matches strip_prefix strip_suffix
-    is_char_boundary get get_mut get_or_insert get_or_insert_with contains contains_key entry
-    or_insert or_insert_with and_modify keys values values_mut
-
+    is_char_boundary contains contains_key keys values values_mut
     pow powi powf abs abs_diff signum is_positive is_negative rem_euclid div_euclid clamp total_cmp
     checked_add checked_sub checked_mul checked_div checked_rem checked_pow checked_neg checked_abs
     saturating_add saturating_sub saturating_mul saturating_div saturating_pow
@@ -574,31 +587,25 @@ SAFE_CALLS |= set("""
     is_alphanumeric is_alphabetic is_numeric is_ascii_digit is_ascii_alphabetic is_ascii_alphanumeric
     is_ascii_whitespace is_ascii_uppercase is_ascii_lowercase is_ascii_hexdigit is_ascii_punctuation
     is_ascii_graphic is_ascii_control is_uppercase is_lowercase is_whitespace is_control
-
-    sorted reversed enumerate sum min max abs round any all format startswith endswith
-    lower upper title capitalize casefold lstrip rstrip splitlines partition rpartition zfill ljust
-    rjust center expandtabs isdigit isalpha isalnum isspace isdecimal isnumeric isidentifier
-    index rindex remove discard add union intersection difference symmetric_difference issubset
-    issuperset isdisjoint bit_length is_integer oct fromhex conjugate real imag items update
-    setdefault popitem deepcopy dumps loads dump subTest skipTest setUp tearDown setUpClass tearDownClass
-
-    includes indexOf lastIndexOf slice splice forEach some every flat flatMap shift unshift
-    toString toFixed toPrecision padStart padEnd toUpperCase toLowerCase stringify has hasOwn
+    format startswith endswith lower upper title capitalize casefold strip lstrip rstrip splitlines
+    partition rpartition zfill ljust rjust center expandtabs isdigit isalpha isalnum isspace isdecimal
+    isnumeric isidentifier union intersection difference symmetric_difference issubset issuperset
+    isdisjoint bit_length is_integer oct fromhex conjugate real imag items
+    includes indexOf lastIndexOf slice some every flat flatMap toString toFixed toPrecision
+    padStart padEnd toUpperCase toLowerCase stringify hasOwn
 """.split())
-STD_HEADS = STD_TYPES | {"File","OpenOptions","Read","Write","Seek","Cursor","Ordering","From","Into","TryFrom",
-             "TryInto","AsRef","AsMut","Default","Clone","Copy","Debug","Display","Iterator","IntoIterator",
-             "ToString","FromStr","AtomicUsize","AtomicBool","AtomicI32","Self","DateTime","Utc","NaiveDateTime",
-             "OnceLock","OnceCell","LazyLock","LazyCell","AtomicU8","AtomicU16","AtomicU64","AtomicI64",
-             "AtomicPtr","AtomicIsize","JoinHandle","PathBuf","OsString","CString",
+CALL_RE = re.compile(r"([A-Za-z_]\w*(?:\s*(?:::|\.)\s*[A-Za-z_]\w*)*)\s*\(")
+FUNC_RE = re.compile(r"\b(?:pub\s+)?(?:async\s+)?(?:fn|def|func|function)\s+([A-Za-z_]\w*)|(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_]\w*\s*=>)")
+
+STD_TYPES = {"String","Vec","HashMap","BTreeMap","HashSet","BTreeSet","Box","Arc","Rc","Cell","RefCell",
+             "Regex","Json","Value","Map","Seq","Number","Cow","Bytes","Chars","Iter","Option","Result","Range","VecDeque"}
+STD_HEADS = STD_TYPES | {"Ordering","From","Into","TryFrom","TryInto","AsRef","AsMut","Default","Clone","Copy",
+             "Debug","Display","Iterator","IntoIterator","ToString","FromStr",
              "f32","f64","i8","i16","i32","i64","i128","u8","u16","u32","u64","u128","usize","isize","str","char","bool"}
 STD_MODULES = set("""
-    std core alloc thread env fs path fmt sync mem slice iter vec option result cmp hash borrow convert marker
-    ops ptr rc arc ascii num str string hint any cell refcell os sys json math re collections itertools
-    functools pathlib typing dataclasses datetime time random hashlib base64 copy abc enum io operator
-    statistics decimal fractions textwrap struct binascii zlib csv glob fnmatch heapq bisect array numbers
-    warnings traceback pprint difflib secrets hmac calendar uuid types unittest pytest contextlib weakref
-    queue logging platform packaging setuptools typing_extensions inspect
-    Math JSON Object Array Number String Boolean Promise Date console RegExp Map Set Reflect Intl
+    core alloc fmt mem slice iter vec option result cmp hash borrow convert marker ops ptr rc arc ascii num str string hint any cell refcell
+    json math re collections itertools functools dataclasses typing enum operator statistics decimal fractions textwrap struct binascii zlib csv fnmatch heapq bisect array numbers difflib hashlib hmac calendar uuid types contextlib typing_extensions
+    Math JSON Object Array Number String Boolean RegExp Map Set Reflect Intl
 """.split())
 AMBIG = object()
 STR_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
@@ -613,18 +620,25 @@ def calls_in(text):
     for m in CALL_RE.finditer(masked):
         before = masked[m.start()-1] if m.start() else ""
         if before in {"!", "[", "#", "@"}: continue
-        if m.group(1).strip() == "pub": continue
+        expr = m.group(1)
+        if expr.strip() == "pub": continue
         if DEF_HEAD_RE.search(masked[max(0, m.start()-24):m.start()]): continue
-        out.append((m.group(1).split("::")[-1].strip(), [p.strip() for p in m.group(1).split("::")]))
+        parts = [p.strip() for p in re.split(r"::|\.", expr)]
+        chained = before == "."
+        dotted = "." in expr
+        out.append((parts[-1], parts, dotted, chained))
     return out
 
-def function_map(repo):
-    fmap = {"root": repo, "defs": {}, "files": set(), "mods": {}, "modules": None}
+def function_map(repo, overlay=None):
+    fmap = {"root": repo, "defs": {}, "files": set(), "mods": {}, "modules": None, "overlay": overlay or {}}
     exts = {"rs","py","zig","go","js","ts","tsx","jsx","mjs","cjs","cs","lisp","el","rb","lua"}
     for rel in tracked(repo):
         if ext_of(rel) not in exts or any(x in SKIP_DIRS for x in rel.split("/")): continue
-        try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
-        except OSError: continue
+        if overlay and rel in overlay:
+            text = overlay[rel]
+        else:
+            try: text = open(os.path.join(repo, rel), encoding="utf-8", errors="ignore").read()
+            except OSError: continue
         fmap["files"].add(rel)
         marks = [(m.start(), m.group(1) or m.group(2)) for m in FUNC_RE.finditer(text)]
         for i, (start, name) in enumerate(marks):
@@ -667,9 +681,13 @@ def repo_modules(fmap):
 def file_mods(fmap, rel):
     cache = fmap.setdefault("mods", {})
     if rel not in cache:
-        text = ""
-        try: text = open(os.path.join(fmap.get("root") or ".", rel), encoding="utf-8", errors="ignore").read()
-        except OSError: pass
+        overlay = fmap.get("overlay") or {}
+        if rel in overlay:
+            text = overlay[rel]
+        else:
+            text = ""
+            try: text = open(os.path.join(fmap.get("root") or ".", rel), encoding="utf-8", errors="ignore").read()
+            except OSError: pass
         cache[rel] = imported_modules(rel, text)
     return cache[rel]
 
@@ -695,14 +713,22 @@ def follows_clean(d, fmap, stack, depth):
 def traced_unit(rel, text, fmap, stack, depth=0):
     if spawn_hit(rel, text): return False
     if depth > 32: return False
-    for name, path in calls_in(text):
+    for name, path, dotted, chained in calls_in(text):
         qual = path[-2] if len(path) > 1 else ""
-        if qual in {"", "crate", "super", "self", "Self"}:
+        if chained:
+            if name in SAFE_METHODS and name not in (fmap.get("defs") or {}): continue
+            return False
+        if qual == "":
             d = resolve_call(name, rel, fmap, qual)
             if d is AMBIG: return False
             if d is None:
-                if not qual and (name in SAFE_CALLS or name in STD_HEADS or name.startswith("assert")): continue
+                if name in SAFE_CALLS or name in STD_HEADS or name.startswith("assert"): continue
                 return False
+            if not follows_clean(d, fmap, stack, depth): return False
+            continue
+        if qual in {"crate", "super", "self", "Self"}:
+            d = resolve_call(name, rel, fmap, qual)
+            if d is None or d is AMBIG: return False
             if not follows_clean(d, fmap, stack, depth): return False
             continue
         if qual in repo_modules(fmap):
@@ -710,7 +736,10 @@ def traced_unit(rel, text, fmap, stack, depth=0):
             if d is None or d is AMBIG: return False
             if not follows_clean(d, fmap, stack, depth): return False
             continue
-        if qual in STD_MODULES or qual in STD_HEADS: continue
+        if qual in STD_MODULES or qual in STD_HEADS:
+            if qual == "json" and name in {"load", "dump"}: return False
+            continue
+        if dotted and name in SAFE_METHODS and name not in (fmap.get("defs") or {}): continue
         return False
     return True
 
@@ -763,16 +792,35 @@ def rust_str_end(text, i):
         k += 1
     return len(text)
 
+def rust_char_end(text, j, n):
+    if j + 1 < n and text[j + 1] == "\\":
+        k = text.find("'", j + 2, min(n, j + 16))
+        if k >= 0 and "\n" not in text[j:k]:
+            return k + 1
+    if j + 2 < n and text[j + 2] == "'" and text[j + 1] not in {"\n", "'"}:
+        return j + 3
+    return None
+
+def rust_block_comment_end(text, j, n):
+    depth = 1; j += 2
+    while j < n and depth > 0:
+        if text.startswith("/*", j): depth += 1; j += 2
+        elif text.startswith("*/", j): depth -= 1; j += 2
+        else: j += 1
+    return j
+
 def rust_brace_end(text, i):
     n = len(text); depth = 0; j = i
     while j < n:
         c = text[j]
         if c == '"': j = rust_str_end(text, j); continue
-        if c == "'" and j + 2 < n and text[j + 2] == "'": j += 3; continue
+        if c == "'":
+            ce = rust_char_end(text, j, n)
+            if ce is not None: j = ce; continue
         if text.startswith("//", j):
             k = text.find("\n", j); j = n if k < 0 else k; continue
         if text.startswith("/*", j):
-            k = text.find("*/", j + 2); j = n if k < 0 else k + 2; continue
+            j = rust_block_comment_end(text, j, n); continue
         if c == "{": depth += 1
         elif c == "}":
             depth -= 1
@@ -785,11 +833,13 @@ def rust_item_end(text, i):
     while j < n:
         c = text[j]
         if c == '"': j = rust_str_end(text, j); continue
-        if c == "'" and j + 2 < n and text[j + 2] == "'": j += 3; continue
+        if c == "'":
+            ce = rust_char_end(text, j, n)
+            if ce is not None: j = ce; continue
         if text.startswith("//", j):
             k = text.find("\n", j); j = n if k < 0 else k; continue
         if text.startswith("/*", j):
-            k = text.find("*/", j + 2); j = n if k < 0 else k + 2; continue
+            j = rust_block_comment_end(text, j, n); continue
         if c == "{": return rust_brace_end(text, j)
         if c == ";": return j + 1
         j += 1
@@ -908,8 +958,7 @@ def plan_tests(repo, exclude, only=None, fmap=None):
         if verdict == "e2e": keeps.append((full, "keep-e2e:" + why, 0))
         elif verdict == "unknown": keeps.append((full, "keep-unknown:no evidence it is a unit test", 0))
         else: cands.append(rel)
-    roots = {test_root(p) for p, kind, _ in keeps if kind.startswith("keep-e2e")}
-    roots.discard("")
+    roots = {test_root(os.path.relpath(p, repo).replace(os.sep, "/")) for p, kind, _ in keeps if kind.startswith("keep-e2e")}
     pending = []
     for rel in cands:
         if test_root(rel) in roots and any(s.lower() in FIXTURE_DIR_NAMES for s in rel.split("/")[:-1]):
@@ -1253,7 +1302,8 @@ def hook() -> int:
                 bad.append((f, line, n["text"].strip().splitlines()[0][:70]))
     if tests_on(top):
         names = project_names(top)
-        fmap = function_map(top)
+        overlay = {f: data.decode("utf-8", "ignore") for f, (_, data, _) in blobs.items()}
+        fmap = function_map(top, overlay=overlay)
         for f in staged(top):
             if ignored(patterns, f) or any(x in SKIP_DIRS for x in f.split("/")): continue
             if not test_candidate(f) or e2e_named(f): continue
