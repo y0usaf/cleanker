@@ -26,6 +26,8 @@ const written = (input: unknown): string | undefined => {
 };
 
 export default function (pi: ExtensionAPI) {
+  const touched = new Set<string>();
+
   pi.registerCommand("cleanker", {
     description: "Run cleanker: status, dry-run, or clean",
     handler: async (args, ctx) => {
@@ -45,19 +47,24 @@ export default function (pi: ExtensionAPI) {
     if (!rel) return;
     const abs = isAbsolute(rel) ? rel : join(ctx.cwd, rel);
     if (!existsSync(abs)) return;
+    touched.add(abs);
     const fix = run(ctx.cwd, ["clean", "--file", abs]);
     const n = counts(fix.out);
     if (n > 0) ctx.ui.notify(`cleanker: ${n} change(s) in ${rel}`, "info");
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    const check = run(ctx.cwd, ["dry-run", "--check"]);
+    const files = [...touched].filter((p) => existsSync(p));
+    touched.clear();
+    if (files.length === 0) return;
+    const fileArgs = files.flatMap((f) => ["--file", f]);
+    const check = run(ctx.cwd, ["dry-run", "--check", ...fileArgs]);
     if (check.code === 0) return;
     if (check.code !== 1) {
       ctx.ui.notify(`cleanker: ${check.out.trim().split("\n").pop()}`, "warning");
       return;
     }
-    const fix = run(ctx.cwd, ["clean"]);
+    const fix = run(ctx.cwd, ["clean", ...fileArgs]);
     const n = counts(fix.out);
     if (n > 0) ctx.ui.notify(`cleanker: ${n} change(s) in ${ctx.cwd}`, "info");
   });

@@ -4,7 +4,7 @@ pkgs.stdenv.mkDerivation {
   version = "1";
   src = ./.;
   nativeBuildInputs = [pkgs.makeWrapper];
-  nativeCheckInputs = [pkgs.git pkgs.ast-grep];
+  nativeCheckInputs = [pkgs.git pkgs.ast-grep pkgs.nodejs];
   doCheck = true;
   checkPhase = ''
             ${pkgs.python3}/bin/python3 -c 'import sys; compile(open(sys.argv[1]).read(), sys.argv[1], "exec")' $src/cleanker.py
@@ -235,6 +235,59 @@ pkgs.stdenv.mkDerivation {
               echo "cleanker check: esc_tests survived" >&2
               exit 1
             fi
+            mkdir -p "$tmp/bin" "$tmp/ext"
+            printf '#!/bin/sh\nexec %s/bin/python3 %s/cleanker.py "$@"\n' "${pkgs.python3}" "$src" > "$tmp/bin/cleanker"
+            chmod +x "$tmp/bin/cleanker"
+            git -C "$tmp/ext" init -q
+            git -C "$tmp/ext" config user.email test@example.com
+            git -C "$tmp/ext" config user.name test
+            git -C "$tmp/ext" config --local cleanker.policy true
+            printf '# pre-existing comment\nx = 1\n' > "$tmp/ext/dirty.py"
+            printf '# keep me\nz = 3\n' > "$tmp/ext/read_only.py"
+            git -C "$tmp/ext" add -A
+            git -C "$tmp/ext" -c core.hooksPath=/dev/null commit -qm init
+            printf '# modified unrelated\nx = 1\n' > "$tmp/ext/dirty.py"
+            for ext_file in "$src/omp-cleanker/omp-extension.ts" "$src/pi-cleanker/pi-extension.ts"; do
+              printf '# agent comment\ny = 2\n' > "$tmp/ext/agent.py"
+              PATH="$tmp/bin:$PATH" ${pkgs.nodejs}/bin/node --input-type=module -e '
+                import fs from "node:fs";
+                import path from "node:path";
+                const mod = (await import(process.argv[1])).default;
+                const cwd = process.argv[2];
+                const handlers = new Map();
+                const cmds = new Map();
+                const notes = [];
+                mod({
+                  registerCommand(name, def) { cmds.set(name, def); },
+                  on(ev, fn) { handlers.set(ev, fn); },
+                });
+                const ctx = { cwd, ui: { notify(msg, level) { notes.push({ msg, level }); } } };
+                await handlers.get("tool_result")({ toolName: "read", input: { path: "read_only.py" }, isError: false }, ctx);
+                if (!fs.readFileSync(path.join(cwd, "read_only.py"), "utf8").includes("# keep me")) {
+                  throw new Error("read tool_result modified read_only.py");
+                }
+                await handlers.get("tool_result")({ toolName: "write", input: { path: "agent.py" }, isError: false }, ctx);
+                if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
+                  throw new Error("write tool_result did not clean agent.py");
+                }
+                fs.writeFileSync(path.join(cwd, "agent.py"), "# later comment\ny = 2\n");
+                await handlers.get("agent_end")({}, ctx);
+                if (fs.readFileSync(path.join(cwd, "agent.py"), "utf8").trim() !== "y = 2") {
+                  throw new Error("agent_end did not clean session-touched agent.py");
+                }
+                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                  throw new Error("agent_end modified unrelated dirty.py");
+                }
+                await handlers.get("agent_end")({}, ctx);
+                if (!fs.readFileSync(path.join(cwd, "dirty.py"), "utf8").includes("# modified unrelated")) {
+                  throw new Error("empty agent_end modified unrelated dirty.py");
+                }
+                await cmds.get("cleanker").handler("dry-run --strip-tests", ctx);
+                if (!notes.some((n) => n.level === "info")) {
+                  throw new Error("cleanker command failed to split flags");
+                }
+              ' "$ext_file" "$tmp/ext"
+            done
   '';
   installPhase = ''
     install -Dm755 $src/cleanker.py $out/libexec/cleanker.py
