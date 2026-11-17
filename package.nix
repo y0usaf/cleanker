@@ -269,6 +269,14 @@ pkgs.stdenv.mkDerivation {
               echo "cleanker check: pre-push allowed dirty commit due to clean working tree" >&2
               exit 1
             fi
+            ${pkgs.python3}/bin/python3 -c 'import sys; sys.stdout.write("# bad over 2MB\n" + "x = 1\n" * 350000)' > "$tmp/push/big.py"
+            git -C "$tmp/push" add big.py
+            git -C "$tmp/push" -c core.hooksPath=/dev/null commit -qm big
+            big_sha=$(git -C "$tmp/push" rev-parse HEAD)
+            if (cd "$tmp/push" && printf 'refs/heads/main %s refs/heads/main %s\n' "$big_sha" "$dirty_sha" | ${pkgs.python3}/bin/python3 "$src/cleanker.py" pre-push); then
+              echo "cleanker check: pre-push skipped >2MB commented source file" >&2
+              exit 1
+            fi
             mkdir -p "$tmp/bin" "$tmp/ext"
             printf '#!/bin/sh\nexec %s/bin/python3 %s/cleanker.py "$@"\n' "${pkgs.python3}" "$src" > "$tmp/bin/cleanker"
             chmod +x "$tmp/bin/cleanker"

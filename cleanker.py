@@ -1260,7 +1260,7 @@ def pre_push() -> int:
             files = sorted(f for f in changed if f in entries and not ignored(patterns, f) and not any(x in SKIP_DIRS for x in f.split("/")))
             if not files: continue
             md = [f for f in files if f.lower().endswith((".md",".mdx")) and md_policy(f) == "drop"]
-            want = {entries[f][0] for f in files if not f.lower().endswith((".md",".mdx")) and entries[f][1] <= 2_000_000}
+            want = {entries[f][0] for f in files if not f.lower().endswith((".md",".mdx")) and (LANG_OF_EXT.get(ext_of(f)) or (check_tests and (test_candidate(f) or ext_of(f) in {"rs","py","zig"})))}
             need_tree = bool(md or check_tests)
             tree_blobs = {}
             if need_tree:
@@ -1269,8 +1269,8 @@ def pre_push() -> int:
                         want.add(oid)
             raw_oids = batch_blobs(top, list(want))
             if need_tree:
-                for path, (oid, _) in entries.items():
-                    if oid in raw_oids: tree_blobs[path] = raw_oids[oid]
+                for path, (oid, size) in entries.items():
+                    if size <= 2_000_000 and oid in raw_oids: tree_blobs[path] = raw_oids[oid]
             lf = collections.defaultdict(list)
             tmp_of = {}
             for f in files:
